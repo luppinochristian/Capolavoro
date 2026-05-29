@@ -1,0 +1,730 @@
+/*
+ * ============================================================
+ * gilded_velocity_override.css — Override tema "Gilded Velocity"
+ * ============================================================
+ * Sovrascritture CSS specifiche per il tema visivo premium
+ * "Gilded Velocity": velocità e lusso in stile notturno.
+ *
+ * Modifica e raffina componenti di style.css per ottenere:
+ *  - Gradienti più profondi sui bottoni e card
+ *  - Effetti glassmorphism sulle superfici principali
+ *  - Animazioni più fluide sulle transizioni di pagina
+ *  - Tipografia con spaziatura lettere aumentata
+ *  - Bordi luminosi (glow) sugli elementi interattivi
+ *  - Scrollbar personalizzata nel tema scuro
+ *
+ * Da caricare DOPO style.css e PRIMA di enhancements.css.
+ * Non modificare: usa enhancements.css per personalizzazioni.
+ * ============================================================
+ */
+
+/* ── Google Fonts Import ─────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;900&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/* ── Enhanced Root Variables ─────────────────────────────────── */
+:root {
+    /* Core palette — refined */
+    --gold: #FFD700;
+    --gold-dark: #C5A000;
+    --gold-soft: #d4a843;
+    --gold-muted: rgba(255, 215, 0, 0.65);
+    --bg: #060a14;
+    --bg2: #0c1220;
+    --bg3: #151d2e;
+    --card: #111c2e;
+    --card-elevated: #162236;
+    --border: #1e2d45;
+    --border-subtle: #182438;
+    --text: #e8ecf4;
+    --text-dim: #7b8ba5;
+    --green: #10b981;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --purple: #8b5cf6;
+    --amber: #f59e0b;
+    --emerald: #059669;
+
+    /* Glow system */
+    --gold-glow: rgba(255, 215, 0, 0.25);
+    --gold-glow-strong: rgba(255, 215, 0, 0.5);
+    --gold-glow-subtle: rgba(255, 215, 0, 0.08);
+
+    /* Shadows — layered depth */
+    --shadow-card: 0 2px 8px rgba(0,0,0,0.3), 0 8px 32px rgba(0,0,0,0.2);
+    --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.4), 0 16px 48px rgba(0,0,0,0.25), 0 0 0 1px rgba(255,215,0,0.08);
+    --shadow-gold: 0 4px 20px rgba(255,215,0,0.15), 0 0 60px rgba(255,215,0,0.05);
+    --shadow-deep: 0 20px 60px rgba(0,0,0,0.7);
+
+    /* Glass */
+    --glass: rgba(255, 255, 255, 0.025);
+    --glass-border: rgba(255, 255, 255, 0.06);
+
+    /* Radii — slightly rounder */
+    --radius-sm:  10px;
+    --radius-md: 16px;
+    --radius-lg: 22px;
+    --radius-xl: 28px;
+
+    /* Typography */
+    --font-display: 'Big Shoulders Display', 'Impact', sans-serif;
+    --font-body: 'Inter', -apple-system, system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* ── Global Typography ───────────────────────────────────────── */
+body {
+    font-family: var(--font-body) !important;
+    background: var(--bg);
+    color: var(--text);
+    letter-spacing: 0.01em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* background overlay removed */
+
+/* ── HEADER — Cinematic ──────────────────────────────────────── */
+header {
+    background: linear-gradient(180deg, #080e1c 0%, #0c1424 100%) !important;
+    border-bottom: 1.5px solid var(--gold) !important;
+    box-shadow: 
+        0 1px 0 0 rgba(255,215,0,0.3),
+        0 4px 30px rgba(0,0,0,0.6),
+        0 0 80px rgba(255,215,0,0.04) !important;
+    padding: 10px 24px !important;
+}
+
+/* Header — gold glow under border */
+header::after {
+    content: '';
+    position: absolute;
+    bottom: -1px;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,215,0,0.5), transparent);
+    filter: blur(3px);
+    pointer-events: none;
+}
+
+.logo h1 {
+    font-family: var(--font-display) !important;
+    font-size: 1.5rem !important;
+    font-weight: 900 !important;
+    letter-spacing: 2px !important;
+    background: linear-gradient(135deg, var(--gold) 0%, #fff 50%, var(--gold) 100%) !important;
+    background-size: 200% 100%;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+}
+
+.logo p {
+    font-family: var(--font-mono) !important;
+    font-size: 0.6rem !important;
+    letter-spacing: 3px !important;
+    color: var(--text-dim) !important;
+    text-transform: uppercase;
+}
+
+/* Nav buttons — refined */
+nav button {
+    font-family: var(--font-body) !important;
+    font-weight: 600 !important;
+    font-size: 0.82rem !important;
+    padding: 7px 14px !important;
+    border-radius: 10px !important;
+    border: 1px solid var(--border-subtle) !important;
+    background: transparent !important;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    letter-spacing: 0.02em;
+}
+
+nav button:hover,
+nav button.active {
+    border-color: var(--gold) !important;
+    color: var(--gold) !important;
+    background: rgba(255,215,0,0.06) !important;
+    box-shadow: 0 0 20px rgba(255,215,0,0.06) !important;
+}
+
+nav button.active {
+    font-weight: 700 !important;
+    background: rgba(255,215,0,0.10) !important;
+    box-shadow: 
+        0 0 20px rgba(255,215,0,0.08),
+        inset 0 0 12px rgba(255,215,0,0.04) !important;
+}
+
+/* ── AUTH PAGE — Dramatic ────────────────────────────────────── */
+#auth-page {
+    background: 
+        radial-gradient(ellipse at 50% 30%, rgba(255,215,0,0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at center, #0e1428 0%, #060a14 80%) !important;
+}
+
+.auth-box {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-top: 2px solid var(--gold) !important;
+    border-radius: 20px !important;
+    box-shadow: var(--shadow-deep), 0 0 100px rgba(255,215,0,0.04) !important;
+    backdrop-filter: blur(20px);
+}
+
+.auth-logo h1 {
+    font-family: var(--font-display) !important;
+    font-size: 2.4rem !important;
+    letter-spacing: 3px !important;
+}
+
+.auth-tab {
+    font-family: var(--font-body) !important;
+    font-weight: 700 !important;
+    border-radius: 10px !important;
+    transition: all 0.2s !important;
+}
+
+.auth-tab.active {
+    background: var(--gold) !important;
+    box-shadow: 0 4px 15px rgba(255,215,0,0.3) !important;
+}
+
+/* ── CARDS — Depth + Glow ────────────────────────────────────── */
+.stat-card,
+.sidebar-card,
+.info-card,
+.news-card,
+.obiettivi-box,
+.career-year-row,
+.agente-card,
+.team-card,
+.struttura-card,
+.dash-notizie-box,
+.career-chart-box,
+.gs-card,
+.card {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-card) !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+.stat-card:hover,
+.news-card:hover,
+.agente-card:hover,
+.team-card:hover,
+.career-year-row:hover,
+.gs-card:hover,
+.card-interactive:hover {
+    box-shadow: var(--shadow-card-hover) !important;
+    border-color: rgba(255,215,0,0.15) !important;
+    transform: translateY(-3px) !important;
+}
+
+/* ── PLAYER HERO — Premium ───────────────────────────────────── */
+.player-hero {
+    background: linear-gradient(135deg, var(--card) 0%, #15243d 50%, var(--card) 100%) !important;
+    border: 1px solid var(--border) !important;
+    border-left: 3px solid var(--gold) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-card), 0 0 40px rgba(255,215,0,0.04) !important;
+    position: relative;
+    overflow: hidden;
+}
+
+.player-hero::before {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 40%;
+    height: 100%;
+    background: radial-gradient(ellipse at right center, rgba(255,215,0,0.04) 0%, transparent 70%);
+    pointer-events: none;
+}
+
+.player-info h2 {
+    font-family: var(--font-display) !important;
+    font-size: 1.8rem !important;
+    letter-spacing: 1px !important;
+}
+
+.player-avatar {
+    border: 3px solid var(--gold) !important;
+    box-shadow: 0 0 20px rgba(255,215,0,0.2), 0 0 40px rgba(255,215,0,0.05) !important;
+}
+
+/* ── INFO CARDS — Stat emphasis ───────────────────────────────── */
+.info-card {
+    text-align: center !important;
+    padding: 18px 14px !important;
+    border-radius: var(--radius-md) !important;
+    position: relative;
+    overflow: hidden;
+}
+
+.info-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 20%; right: 20%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--gold), transparent);
+    opacity: 0.5;
+}
+
+.info-card .val {
+    font-family: var(--font-display) !important;
+    font-size: 1.8rem !important;
+    font-weight: 900 !important;
+    background: linear-gradient(135deg, var(--gold), #fff) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+}
+
+.info-card .lbl {
+    font-family: var(--font-mono) !important;
+    font-size: 0.65rem !important;
+    letter-spacing: 1.5px !important;
+    color: var(--text-dim) !important;
+}
+
+/* ── STAT BARS — Color-coded + refined ───────────────────────── */
+.stat-bar {
+    width: 100% !important;
+    transform-origin: left !important;
+    border-radius: 5px !important;
+    box-shadow: 0 0 8px rgba(255,215,0,0.1);
+}
+
+.stat-bar-bg {
+    height: 10px !important;
+    background: var(--bg3) !important;
+    border-radius: 5px !important;
+    border: 1px solid var(--border-subtle);
+}
+
+.stat-name {
+    font-family: var(--font-mono) !important;
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.5px !important;
+}
+
+.stat-value {
+    font-family: var(--font-display) !important;
+    font-size: 1rem !important;
+    font-weight: 700 !important;
+}
+
+/* ── BUTTONS — Premium ───────────────────────────────────────── */
+.btn-primary {
+    font-family: var(--font-display) !important;
+    font-size: 1rem !important;
+    letter-spacing: 2px !important;
+    border-radius: 12px !important;
+    padding: 14px !important;
+    background: linear-gradient(135deg, var(--gold) 0%, var(--gold-dark) 100%) !important;
+    box-shadow: 0 4px 20px rgba(255,215,0,0.25) !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 30px rgba(255,215,0,0.4), 0 0 60px rgba(255,215,0,0.1) !important;
+}
+
+.play-btn {
+    font-family: var(--font-display) !important;
+    letter-spacing: 2px !important;
+    border-radius: 12px !important;
+    font-size: 1rem !important;
+    box-shadow: 0 4px 20px rgba(16,185,129,0.25) !important;
+}
+
+.play-btn:hover:not(:disabled) {
+    box-shadow: 0 8px 30px rgba(16,185,129,0.4), 0 0 60px rgba(16,185,129,0.1) !important;
+}
+
+/* ── MODALS — Cinematic ──────────────────────────────────────── */
+.modal-overlay.modal-fade-in {
+    background: rgba(0,0,0,0.88) !important;
+    backdrop-filter: blur(6px) !important;
+}
+
+.modal,
+.modal-box {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-top: 2px solid var(--gold) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-deep), 0 0 80px rgba(255,215,0,0.05) !important;
+}
+
+.modal h3 {
+    font-family: var(--font-display) !important;
+    font-size: 1.5rem !important;
+    letter-spacing: 1px !important;
+}
+
+/* ── MATCH RESULTS — Dramatic scores ─────────────────────────── */
+.res-match-score {
+    font-family: var(--font-display) !important;
+    font-size: 2rem !important;
+    letter-spacing: 6px !important;
+    text-shadow: 0 0 20px rgba(255,215,0,0.3) !important;
+}
+
+.res-match-card {
+    background: var(--bg3) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: var(--radius-sm) !important;
+    box-shadow: var(--shadow-card) !important;
+}
+
+/* ── PAGE TITLES — Display font ──────────────────────────────── */
+.page-title {
+    font-family: var(--font-display) !important;
+    font-size: 1.8rem !important;
+    letter-spacing: 1px !important;
+    line-height: 1.2;
+}
+
+.page-title span {
+    background: linear-gradient(135deg, var(--gold), #fff) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+}
+
+.page-subtitle {
+    font-family: var(--font-body) !important;
+    font-size: 0.88rem !important;
+    color: var(--text-dim) !important;
+}
+
+/* ── OVERALL CIRCLE — Refined glow ───────────────────────────── */
+.overall-circle {
+    box-shadow: 0 0 20px rgba(255,215,0,0.1) !important;
+}
+
+.overall-value {
+    font-family: var(--font-display) !important;
+    font-size: 1.6rem !important;
+}
+
+/* ── DROPDOWN MENUS — Glass effect ───────────────────────────── */
+.exit-dropdown {
+    background: var(--card-elevated) !important;
+    border: 1px solid var(--border) !important;
+    border-top: 2px solid var(--gold) !important;
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-deep) !important;
+    backdrop-filter: blur(20px) !important;
+}
+
+/* ── SETTINGS MODAL — Glass ──────────────────────────────────── */
+.settings-modal-box {
+    background: var(--card) !important;
+    border-radius: var(--radius-lg) !important;
+    border: 1px solid var(--border) !important;
+    box-shadow: var(--shadow-deep) !important;
+}
+
+.settings-header {
+    background: rgba(255,215,0,0.03) !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+
+.settings-header h2 {
+    font-family: var(--font-display) !important;
+    letter-spacing: 1px !important;
+}
+
+/* ── SKILL TREE — Refined nodes ──────────────────────────────── */
+.st-node {
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-card) !important;
+}
+
+.st-node-name {
+    font-family: var(--font-body) !important;
+    font-weight: 800 !important;
+}
+
+.st-upgrade-btn {
+    font-family: var(--font-display) !important;
+    border-radius: 10px !important;
+    letter-spacing: 0.5px !important;
+}
+
+/* ── CHAMPIONS BRACKET — Premium feel ────────────────────────── */
+.bk-bracket,
+.br-wrap {
+    background: rgba(6, 10, 22, 0.8) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-card) !important;
+}
+
+.bk-champion {
+    background: linear-gradient(135deg, rgba(255,215,0,0.15), rgba(255,200,0,0.04)) !important;
+    border: 2px solid rgba(255,215,0,0.5) !important;
+    border-radius: var(--radius-md) !important;
+    box-shadow: 0 0 40px rgba(255,215,0,0.12), inset 0 0 40px rgba(255,215,0,0.03) !important;
+}
+
+.bk-champion-name {
+    font-family: var(--font-display) !important;
+    letter-spacing: 0.5px !important;
+}
+
+/* ── ACHIEVEMENTS — Badge refinement ─────────────────────────── */
+.ach-card {
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-card) !important;
+}
+
+.ach-card.unlocked {
+    border-color: rgba(255,215,0,0.4) !important;
+    box-shadow: var(--shadow-card), 0 0 20px rgba(255,215,0,0.06) !important;
+}
+
+.ach-name {
+    font-family: var(--font-body) !important;
+    font-weight: 800 !important;
+}
+
+/* ── ACHIEVEMENT TOAST — Premium animation ───────────────────── */
+.achievement-toast {
+    background: linear-gradient(135deg, var(--card-elevated), var(--card)) !important;
+    border: 1px solid var(--gold) !important;
+    border-left: 4px solid var(--gold) !important;
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-deep), 0 0 40px rgba(255,215,0,0.15) !important;
+    backdrop-filter: blur(16px) !important;
+}
+
+.ach-toast-name {
+    font-family: var(--font-body) !important;
+    font-weight: 800 !important;
+}
+
+.ach-toast-label {
+    font-family: var(--font-mono) !important;
+}
+
+/* ── COMMENTARY TICKER ───────────────────────────────────────── */
+#gs-commentary-ticker {
+    background: linear-gradient(to top, rgba(6,10,20,0.97), rgba(12,18,32,0.93)) !important;
+    border-top: 1.5px solid rgba(255,215,0,0.35) !important;
+    backdrop-filter: blur(12px) !important;
+}
+
+/* ── TRANSFERS — Team cards ──────────────────────────────────── */
+.team-name {
+    font-family: var(--font-display) !important;
+    font-size: 1.3rem !important;
+    letter-spacing: 0.5px !important;
+}
+
+.team-stars {
+    letter-spacing: 2px !important;
+}
+
+/* ── CAREER — Timeline refinement ────────────────────────────── */
+.career-year-title {
+    font-family: var(--font-display) !important;
+    font-size: 1.1rem !important;
+}
+
+.career-trofeo-badge {
+    font-family: var(--font-body) !important;
+    border-radius: var(--radius-sm) !important;
+}
+
+/* ── TABLES — Refined ────────────────────────────────────────── */
+.table-gs th,
+.gs-table th {
+    font-family: var(--font-mono) !important;
+    font-size: 0.68rem !important;
+    letter-spacing: 1px !important;
+}
+
+/* ── FORM INPUTS — Refined ───────────────────────────────────── */
+.form-group input,
+.form-group select,
+.input {
+    background: var(--bg3) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    font-family: var(--font-body) !important;
+    transition: all 0.25s !important;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.input:focus {
+    border-color: var(--gold) !important;
+    box-shadow: 0 0 0 3px rgba(255,215,0,0.1), 0 0 20px rgba(255,215,0,0.05) !important;
+}
+
+/* ── BADGE — Refined ─────────────────────────────────────────── */
+.badge,
+.gs-badge {
+    font-family: var(--font-mono) !important;
+    font-size: 0.68rem !important;
+    letter-spacing: 0.3px !important;
+}
+
+/* ── PALLONE D'ORO — Ultimate drama ──────────────────────────── */
+.pallone-doro-text {
+    font-family: var(--font-display) !important;
+    letter-spacing: 4px !important;
+}
+
+.pallone-banner {
+    font-family: var(--font-display) !important;
+    letter-spacing: 2px !important;
+    border-radius: var(--radius-md) !important;
+}
+
+/* ── METRIC DISPLAYS ─────────────────────────────────────────── */
+.gs-metric-value,
+.gs-value {
+    font-family: var(--font-display) !important;
+}
+
+.gs-metric-label,
+.gs-label {
+    font-family: var(--font-mono) !important;
+}
+
+/* ── SECTION HEADERS ─────────────────────────────────────────── */
+.section-header {
+    font-family: var(--font-mono) !important;
+    letter-spacing: 2px !important;
+}
+
+.section-title {
+    font-family: var(--font-display) !important;
+}
+
+/* ── SCROLLBAR — Refined ─────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { 
+    background: var(--border); 
+    border-radius: 3px; 
+}
+::-webkit-scrollbar-thumb:hover { 
+    background: rgba(255,215,0,0.4); 
+}
+
+/* ── SELECTION ───────────────────────────────────────────────── */
+::selection {
+    background: rgba(255, 215, 0, 0.25);
+    color: #fff;
+}
+
+/* ── ACTIONS PANEL (Game page) ───────────────────────────────── */
+.actions-panel {
+    background: var(--card) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-card) !important;
+}
+
+.actions-panel h3 {
+    font-family: var(--font-display) !important;
+    font-size: 1.2rem !important;
+}
+
+.action-btn {
+    border-radius: 12px !important;
+    border: 1.5px solid var(--border) !important;
+    transition: all 0.25s !important;
+}
+
+.action-btn:hover {
+    border-color: var(--gold) !important;
+    background: rgba(255,215,0,0.04) !important;
+    box-shadow: 0 0 20px rgba(255,215,0,0.04) !important;
+}
+
+.action-btn .action-name {
+    font-family: var(--font-body) !important;
+    font-weight: 700 !important;
+}
+
+/* ── TOAST — Refined ─────────────────────────────────────────── */
+.toast {
+    background: var(--card-elevated) !important;
+    border-radius: var(--radius-md) !important;
+    box-shadow: var(--shadow-deep) !important;
+    backdrop-filter: blur(16px) !important;
+}
+
+/* ── GOLD SHIMMER ANIMATION — Enhanced ───────────────────────── */
+@keyframes goldShimmerEnhanced {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+}
+
+.gold-shimmer-text {
+    background: linear-gradient(
+        90deg, 
+        var(--gold) 0%, 
+        #fffacd 25%, 
+        var(--gold) 50%, 
+        #fffacd 75%, 
+        var(--gold) 100%
+    ) !important;
+    background-size: 300% 100% !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    animation: goldShimmerEnhanced 3s linear infinite !important;
+}
+
+/* ── NEW SEASON BANNER — Display font ────────────────────────── */
+.new-season-banner .ns-year {
+    font-family: var(--font-display) !important;
+    font-size: 5rem !important;
+    letter-spacing: 4px !important;
+}
+
+.new-season-banner .ns-label {
+    font-family: var(--font-mono) !important;
+    letter-spacing: 6px !important;
+}
+
+/* ── LOADING — Refined ───────────────────────────────────────── */
+.gs-spinner {
+    border: 3px solid var(--border) !important;
+    border-top-color: var(--gold) !important;
+}
+
+/* ── RESPONSIVE — Mobile refinements ─────────────────────────── */
+@media (max-width: 640px) {
+    .page-title {
+        font-size: 1.4rem !important;
+    }
+    .player-info h2 {
+        font-size: 1.4rem !important;
+    }
+    .info-card .val {
+        font-size: 1.4rem !important;
+    }
+    header {
+        padding: 8px 14px !important;
+    }
+    .logo h1 {
+        font-size: 1.2rem !important;
+    }
+}
+
+@media (max-width: 480px) {
+    .page-title {
+        font-size: 1.2rem !important;
+    }
+    .res-match-score {
+        font-size: 1.4rem !important;
+    }
+}

@@ -1,0 +1,37 @@
+services:
+
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: golden_striker
+      MYSQL_USER: gs_user
+      MYSQL_PASSWORD: gs_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "gs_user", "-pgs_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    environment:
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DB: golden_striker
+      MYSQL_USER: gs_user
+      MYSQL_PASS: gs_password
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
