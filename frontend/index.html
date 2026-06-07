@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<!--
+ ============================================================
+ index.html — Pagina principale (Single Page Application)
+ ============================================================
+ Unico file HTML del progetto. Tutta la navigazione avviene
+ tramite JavaScript senza ricaricare la pagina (SPA).
+
+ STRUTTURA DELLE SEZIONI (#id):
+  - #auth-page         : schermata login/registrazione/verifica OTP
+  - #career-select-box : selezione o creazione carriera dopo login
+  - #game-page         : interfaccia principale di gioco, composta da:
+      .player-hero     → header con nome, overall, squadra
+      .info-cards      → statistiche chiave (soldi, gol, struttura)
+      .action-grid     → griglia selezione azioni mensili
+      .news-feed       → ultime notizie della carriera
+  - #skill-page        : albero delle abilità sbloccabili
+  - #agent-page        : gestione agente personale
+  - #notizie-page      : storico notizie completo
+  - #standings-page    : classifica campionato
+  - #champions-page    : tabellone Champions Cup
+  - #objectives-page   : obiettivi e missioni stagionali
+  - #transfer-page     : mercato trasferimenti
+  - #epilogo-page      : schermata fine carriera
+
+ SCRIPT CARICATI (in ordine):
+  gamedata.js → locale.js → commentary.js → achievements.js →
+  season_planner.js → tutorial.js → ui_components.js →
+  gamedata.js → locale.js → commentary.js → achievements.js →
+  season_planner.js → tutorial.js → ui_components.js →
+  analytics.js → timeline.js → particles.js →
+  app.js (main, caricato per ultimo)
+
+ CSS CARICATI:
+  style.css (unico file — merge di style + gilded_velocity_override
+  + enhancements + restyling, cascade preservato)
+ ============================================================
+-->
+<html lang="it" id="html-root">
+<head>
+    <meta charset="UTF-8">
+    <meta name="description" content="Golden Striker — Football career simulator. Road to the Pallone d'Oro.">
+    <meta property="og:title" content="Golden Striker – Road to the Pallone d'Oro">
+    <meta property="og:description" content="Simulatore di carriera calcistica. Porta il tuo giocatore fino al Pallone d'Oro.">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Golden Striker – Road to the Pallone d'Oro</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚽</text></svg>">
+    <!-- Anti-FOUC: nasconde tutte le pagine finché CSS esterno non è pronto -->
+    <style>.page{display:none!important}.page.active{display:block!important}#auth-page.active{display:flex!important}</style>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- HEADER -->
+<header id="main-header">
+    <div class="logo">
+        <span class="icon" aria-hidden="true">⚽</span>
+        <div>
+            <h1>GOLDEN STRIKER</h1>
+            <p>Road to the Pallone d'Oro</p>
+        </div>
+    </div>
+    <nav id="main-nav" style="display:none">
+        <button type="button" data-page="dashboard" data-i18n="nav_dashboard">🏠 Dashboard</button>
+        <button type="button" data-page="game" data-i18n="nav_game">⚽ Gioca</button>
+        <button type="button" data-page="career" data-i18n="nav_career">📊 Carriera</button>
+        <button type="button" data-page="transfer" data-i18n="nav_transfer">🔄 Trasferimento</button>
+        <button type="button" data-page="classifica" data-i18n="nav_classifica">🏟️ Classifica</button>
+        <button type="button" data-page="notizie" id="nav-notizie" data-i18n="nav_notizie">📰 Notizie</button>
+        <!-- EXTRA MENU: raggruppa le funzioni secondarie -->
+        <div class="nav-extra-wrap" id="nav-extra-wrap">
+            <button type="button" class="nav-extra-btn" id="nav-extra-btn" aria-haspopup="true" aria-expanded="false"
+                    onclick="toggleExtraMenu(event)" data-i18n="nav_extra">⋯ Extra</button>
+            <div class="nav-extra-dropdown" id="nav-extra-dropdown" role="menu">
+                <button type="button" role="menuitem" data-page="strutture" data-i18n="nav_strutture">🏗️ Strutture</button>
+                <button type="button" role="menuitem" data-page="agente" data-i18n="nav_agente">🤝 Agente</button>
+                <button type="button" role="menuitem" data-page="skilltree" id="nav-skilltree" data-i18n="nav_skilltree">🌟 Abilità</button>
+                <button type="button" role="menuitem" data-page="achievements" id="nav-achievements" data-i18n="nav_achievements">🏅 Premi</button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- LANG SWITCHER -->
+    <div class="lang-switcher-wrap" id="lang-switcher-wrap" style="display:none">
+        <button type="button" id="lang-switcher-btn" class="lang-switcher-btn" onclick="document.getElementById('lang-switcher-dropdown')?.classList.toggle('open')" aria-haspopup="true" aria-expanded="false">
+            <span id="lang-switcher-flag">🇮🇹</span>
+        </button>
+        <div class="lang-switcher-dropdown" id="lang-switcher-dropdown">
+            <button type="button" class="lang-switcher-opt" id="lang-sw-it" onclick="setLanguage('it');document.getElementById('lang-switcher-dropdown')?.classList.remove('open')">
+                <span>🇮🇹</span><span>Italiano</span>
+            </button>
+            <button type="button" class="lang-switcher-opt" id="lang-sw-en" onclick="setLanguage('en');document.getElementById('lang-switcher-dropdown')?.classList.remove('open')">
+                <span>🇬🇧</span><span>English</span>
+            </button>
+            <button type="button" class="lang-switcher-opt" id="lang-sw-de" onclick="setLanguage('de');document.getElementById('lang-switcher-dropdown')?.classList.remove('open')">
+                <span>🇩🇪</span><span>Deutsch</span>
+            </button>
+            <button type="button" class="lang-switcher-opt" id="lang-sw-es" onclick="setLanguage('es');document.getElementById('lang-switcher-dropdown')?.classList.remove('open')">
+                <span>🇪🇸</span><span>Español</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- SETTINGS BUTTON -->
+    <div class="exit-dropdown-wrap" id="exit-dropdown-wrap" style="display:none">
+        <button type="button" id="exit-menu-btn" class="btn-gold" onclick="document.getElementById('exit-dropdown')?.classList.toggle('open')">⚙️ Menu</button>
+        <div class="exit-dropdown" id="exit-dropdown">
+            <button type="button" class="exit-opt" id="exit-opt-home" onclick="goToCareerSelect();document.getElementById('exit-dropdown')?.classList.remove('open')" style="display:none">
+                <span>🏠</span>
+                <div><div class="exit-opt-title" data-i18n="menu_change_career">Cambia Carriera</div><div class="exit-opt-sub" data-i18n="menu_change_career_sub">Torna alla selezione carriere</div></div>
+            </button>
+            <div class="exit-dropdown-divider" id="exit-divider-home" style="display:none"></div>
+            <button type="button" class="exit-opt" onclick="openSettings();document.getElementById('exit-dropdown')?.classList.remove('open')">
+                <span>⚙️</span>
+                <div><div class="exit-opt-title" data-i18n="menu_settings">Impostazioni</div><div class="exit-opt-sub" data-i18n="menu_settings_sub">Lingua, account, tutorial</div></div>
+            </button>
+            <div class="exit-dropdown-divider"></div>
+            <button type="button" class="exit-opt exit-opt-danger" onclick="doLogout()">
+                <span>🚪</span>
+                <div><div class="exit-opt-title" data-i18n="menu_logout">Logout</div><div class="exit-opt-sub" data-i18n="menu_logout_sub">Disconnetti account</div></div>
+            </button>
+        </div>
+    </div>
+</header>
+
+<!-- ========== SETTINGS MODAL ========== -->
+<div id="settings-modal" class="modal-overlay" onclick="if(event.target===this)closeSettings()">
+  <div class="modal-box settings-modal-box"
+       role="dialog"
+       aria-modal="true"
+       aria-labelledby="settings-modal-title">
+    <div class="settings-header">
+      <span class="settings-icon" aria-hidden="true">⚙️</span>
+      <h2 id="settings-modal-title" data-i18n="settings_title">Impostazioni</h2>
+      <button type="button" class="modal-close-x" onclick="closeSettings()" aria-label="Chiudi impostazioni">✕</button>
+    </div>
+
+    <!-- Lingua -->
+    <div class="settings-section">
+      <div class="settings-section-title" data-i18n="settings_language">🌐 Lingua / Language</div>
+      <div class="settings-lang-row">
+        <button type="button" class="settings-lang-btn active" id="lang-btn-it" onclick="setLanguage('it')">
+          🇮🇹 Italiano
+        </button>
+        <button type="button" class="settings-lang-btn" id="lang-btn-en" onclick="setLanguage('en')">
+          🇬🇧 English
+        </button>
+        <button type="button" class="settings-lang-btn" id="lang-btn-de" onclick="setLanguage('de')">
+          🇩🇪 Deutsch
+        </button>
+        <button type="button" class="settings-lang-btn" id="lang-btn-es" onclick="setLanguage('es')">
+          🇪🇸 Español
+        </button>
+      </div>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <!-- Navigazione -->
+    <div class="settings-section">
+      <div class="settings-section-title" data-i18n="settings_navigate">🗺️ Navigazione</div>
+      <button type="button" class="settings-nav-btn" id="settings-btn-home" onclick="goToCareerSelect();closeSettings()" style="display:none">
+        <span>🏠</span>
+        <div>
+          <div class="settings-opt-title" data-i18n="settings_main_menu">Menu Principale</div>
+          <div class="settings-opt-sub" data-i18n="settings_main_menu_sub">Cambia carriera o creane una nuova</div>
+        </div>
+        <span class="settings-opt-arrow">›</span>
+      </button>
+      <button type="button" class="settings-nav-btn" onclick="openUpdateRequest();closeSettings()">
+        <span>💡</span>
+        <div>
+          <div class="settings-opt-title" data-i18n="settings_feedback">Richiedi un Update</div>
+          <div class="settings-opt-sub" data-i18n="settings_feedback_sub">Invia suggerimenti agli sviluppatori</div>
+        </div>
+        <span class="settings-opt-arrow">›</span>
+      </button>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <!-- Account -->
+    <div class="settings-section">
+      <div class="settings-section-title" data-i18n="settings_account">👤 Account</div>
+      <button type="button" class="settings-nav-btn settings-danger-btn" onclick="doLogout()">
+        <span>🚪</span>
+        <div>
+          <div class="settings-opt-title" data-i18n="settings_logout">Logout Completo</div>
+          <div class="settings-opt-sub" data-i18n="settings_logout_sub">Disconnetti account e torna al login</div>
+        </div>
+      </button>
+    </div>
+
+    <div class="settings-version">Golden Striker v17</div>
+      <button type="button" onclick="if(window.GS_Tutorial){GS_Tutorial.reset();GS_Tutorial.start(true);}" 
+              style="width:100%;margin-top:8px;background:transparent;border:1px solid var(--border);color:var(--text-dim);padding:8px;border-radius:8px;cursor:pointer;font-size:0.8rem">
+        🎓 Tutorial
+      </button>
+  </div>
+</div>
+
+<!-- ========== AUTH PAGE ========== -->
+<div id="auth-page" class="page active">
+  <div id="auth-page-inner">
+    <div class="auth-container">
+      <div class="auth-box" id="auth-box-main">
+        <div class="auth-logo">
+          <span class="ball">⚽</span>
+          <h1>GOLDEN STRIKER</h1>
+          <p>ROAD TO THE PALLONE D'ORO</p>
+        </div>
+        <div class="auth-tabs">
+          <button type="button" class="auth-tab active" data-tab="login" onclick="showAuthTab('login')" data-i18n="auth_login">Accedi</button>
+          <button type="button" class="auth-tab" data-tab="register" onclick="showAuthTab('register')" data-i18n="auth_register">Registrati</button>
+        </div>
+
+        <!-- LOGIN -->
+        <div id="login-form">
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="l-email" placeholder="la-tua@email.com">
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="l-password" placeholder="Password">
+          </div>
+          <p class="error-msg" id="login-error"></p>
+          <button type="button" class="btn-primary" onclick="doLogin()" data-i18n="auth_login_btn">⚽ Accedi</button>
+          <p style="text-align:center;margin-top:12px">
+            <a href="#" onclick="showForgot()" style="color:var(--text-dim);font-size:0.82rem" data-i18n="auth_forgot_link">Password dimenticata?</a>
+          </p>
+          <!-- GUEST MODE -->
+          <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border);text-align:center">
+            <p style="font-size:0.75rem;color:var(--text-dim);margin-bottom:10px" data-i18n="guest_desc">Vuoi provare senza registrarti?</p>
+            <button type="button" onclick="startGuestMode()" style="width:100%;padding:11px;background:transparent;border:1px solid var(--border);border-radius:10px;color:var(--text-mid);font-size:0.88rem;font-family:var(--font-display);font-weight:700;letter-spacing:1px;text-transform:uppercase;cursor:pointer;transition:border-color 0.15s,color 0.15s" onmouseover="this.style.borderColor='var(--green)';this.style.color='var(--green)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-mid)'" data-i18n="guest_btn">👤 Modalità Ospite</button>
+          </div>
+        </div>
+
+        <!-- REGISTER -->
+        <div id="register-form" style="display:none">
+          <div class="form-group">
+            <label data-i18n="auth_username">Username</label>
+            <input type="text" id="r-username" placeholder="es. GoldenStriker99" autocomplete="username">
+            <small style="color:var(--text-dim);font-size:0.75rem" data-i18n="register_username_hint">Solo lettere, numeri e _ (3-30 caratteri)</small>
+          </div>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="r-email" placeholder="la-tua@email.com">
+          </div>
+          <div class="form-group">
+            <label data-i18n="register_pw_label">Password</label>
+            <input type="password" id="r-password" placeholder="">
+          </div>
+          <div class="form-group">
+            <label data-i18n="auth_confirm_pw">Conferma Password</label>
+            <input type="password" id="r-password2" placeholder="">
+          </div>
+          <p class="error-msg" id="register-error"></p>
+          <button type="button" class="btn-primary" onclick="doRegister()" data-i18n="auth_register_btn">🌟 Crea Account</button>
+        </div>
+
+        <!-- FORGOT PASSWORD -->
+        <div id="forgot-form" style="display:none">
+          <p style="color:var(--text-dim);margin-bottom:14px;font-size:0.85rem" data-i18n="forgot_desc">Inserisci la tua email e ti manderemo le istruzioni per reimpostare la password.</p>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="f-email" placeholder="la-tua@email.com">
+          </div>
+          <p class="error-msg" id="forgot-error"></p>
+          <button type="button" class="btn-primary" onclick="doForgot()" data-i18n="auth_forgot_btn">📧 Invia Istruzioni</button>
+          <button type="button" onclick="showAuthTab('login')" style="width:100%;margin-top:8px;background:transparent;border:1px solid var(--border);color:var(--text-dim);padding:10px;border-radius:8px;cursor:pointer" data-i18n="auth_back_login">← Torna al Login</button>
+        </div>
+      </div>
+
+      <!-- SELEZIONE CARRIERA (dopo login) -->
+      <div class="auth-box" id="career-select-box" style="display:none;max-width:700px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+          <div>
+            <h2 style="color:var(--gold);margin:0" data-i18n="career_select_title">Le tue Carriere</h2>
+            <p style="color:var(--text-dim);font-size:0.82rem;margin:4px 0 0" id="career-account-email"></p>
+          </div>
+        </div>
+        <div id="careers-list"></div>
+        <button type="button" class="btn-primary" id="btn-new-career" onclick="showCreateCareer()" style="width:100%;margin-top:16px" data-i18n="career_new">➕ Nuova Carriera</button>
+        <p id="careers-limit-msg" style="text-align:center;color:var(--text-dim);font-size:0.8rem;margin-top:8px;display:none" data-i18n="careers_limit">Hai raggiunto il limite di 5 carriere.</p>
+      </div>
+
+      <!-- CREA NUOVA CARRIERA — Wizard 4 Step -->
+      <div id="create-career-box" style="display:none">
+        <div class="cc-wizard">
+
+          <!-- Progress bar -->
+          <div class="cc-progress">
+            <div class="cc-step-pill active" id="pill-1">1</div>
+            <div class="cc-step-line" id="line-1-2"></div>
+            <div class="cc-step-pill" id="pill-2">2</div>
+            <div class="cc-step-line" id="line-2-3"></div>
+            <div class="cc-step-pill" id="pill-3">3</div>
+            <div class="cc-step-line" id="line-3-4"></div>
+            <div class="cc-step-pill" id="pill-4">4</div>
+          </div>
+          <div class="cc-step-labels">
+            <span data-i18n="cc_step1">Identità</span>
+            <span data-i18n="cc_step2">Aspetto</span>
+            <span data-i18n="cc_step3">Stile</span>
+            <span data-i18n="cc_step4">Conferma</span>
+          </div>
+
+          <!-- STEP 1: Identità -->
+          <div class="cc-panel active" id="cc-step-1">
+            <div class="cc-panel-header">
+              <div class="cc-panel-icon">⚽</div>
+              <div>
+                <h3 data-i18n="cc_step1_title">Chi sei?</h3>
+                <p data-i18n="cc_step1_sub">Il tuo nome entrerà nella storia del calcio</p>
+              </div>
+            </div>
+
+            <div class="cc-fields">
+              <div class="cc-field">
+                <label data-i18n="create_name_label">Nome Carriera</label>
+                <input type="text" id="c-career-name" placeholder="es. La mia prima carriera" maxlength="40">
+              </div>
+              <div class="cc-field">
+                <label data-i18n="create_player_label">Nome Calciatore</label>
+                <input type="text" id="c-name" placeholder="es. Marco Rossi" maxlength="30">
+              </div>
+
+              <div class="cc-field-row">
+                <div class="cc-field">
+                  <label data-i18n="create_gender">Sesso</label>
+                  <div class="cc-toggle-group" id="gender-toggle">
+                    <button type="button" class="cc-toggle active" data-val="male" onclick="ccSetGender('male')" data-i18n="gender_male">⚽ Maschio</button>
+                    <button type="button" class="cc-toggle" data-val="female" onclick="ccSetGender('female')" data-i18n="gender_female">⚽ Femmina</button>
+                  </div>
+                </div>
+                <div class="cc-field">
+                  <label data-i18n="create_age">Età di inizio</label>
+                  <div class="cc-age-selector">
+                    <button type="button" onclick="ccAgeStep(-1)">−</button>
+                    <span id="c-age-display">17</span>
+                    <button type="button" onclick="ccAgeStep(1)">+</button>
+                    <input type="hidden" id="c-age" value="17">
+                  </div>
+                </div>
+              </div>
+
+              <div class="cc-field">
+                <label data-i18n="create_nationality">Nazionalità</label>
+                <div class="cc-nation-dropdown" id="cc-nation-dropdown">
+                  <button type="button" class="cc-nation-trigger" id="cc-nation-trigger"
+                          onclick="ccToggleNationDropdown()" style="--nat-color:#009246;">
+                    <img class="cc-nation-flag-img" id="cc-trigger-flag"
+                         src="https://flagcdn.com/w40/it.png" alt="Italy">
+                    <span id="cc-trigger-name">Italia</span>
+                    <span class="cc-dropdown-arrow">▾</span>
+                  </button>
+                  <div class="cc-nation-panel" id="cc-nation-panel">
+                    <div class="cc-nation-search-wrap">
+                      <input type="text" id="cc-nation-search-input"
+                             data-i18n-placeholder="cc_nation_search"
+                             placeholder="🔍 Cerca nazione..."
+                             oninput="ccFilterNations(this.value)" autocomplete="off">
+                    </div>
+                    <div class="cc-nation-scroll" id="cc-nation-list"></div>
+                  </div>
+                </div>
+                <input type="hidden" id="c-nationality" value="Italy">
+              </div>
+            </div>
+
+            <div class="cc-nav">
+              <button type="button" class="cc-btn-back" onclick="showCareerSelectBack()" data-i18n="cc_back">← Indietro</button>
+              <button type="button" class="cc-btn-next" onclick="ccNextStep(1)" data-i18n="cc_next">Avanti →</button>
+            </div>
+          </div>
+
+          <!-- STEP 2: Aspetto -->
+          <div class="cc-panel" id="cc-step-2">
+            <div class="cc-panel-header">
+              <div class="cc-panel-icon">🧑</div>
+              <div>
+                <h3 data-i18n="cc_step2_title">Il tuo aspetto</h3>
+                <p data-i18n="cc_step2_sub">Personalizza il tuo calciatore</p>
+              </div>
+            </div>
+
+            <div class="cc-appearance">
+              <!-- Avatar preview -->
+              <div class="cc-avatar-col">
+                <div class="cc-avatar-ring">
+                  <div id="avatar-preview" style="width:130px;height:130px;border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center"></div>
+                </div>
+                <div class="cc-avatar-modes">
+                  <button type="button" class="cc-mode-btn active" id="btn-mode-default" onclick="setAvatarMode('default')">🎨 SVG</button>
+                  <button type="button" class="cc-mode-btn" id="btn-mode-ai" onclick="setAvatarMode('ai')">✨ AI</button>
+                </div>
+              </div>
+
+              <!-- Controls -->
+              <div class="cc-appearance-controls">
+                <!-- Default mode -->
+                <div id="avatar-default-panel">
+                  <div class="cc-field">
+                    <label data-i18n="create_skin">Carnagione</label>
+                    <div class="skin-tone-row" id="skin-tone-picker"></div>
+                  </div>
+                  <div class="cc-field">
+                    <label data-i18n="create_hairstyle">Capelli</label>
+                    <div class="hair-style-picker" id="hair-style-picker"></div>
+                  </div>
+                  <div class="cc-field" id="hair-color-group">
+                    <label data-i18n="create_haircolor">Colore Capelli</label>
+                    <div class="hair-color-row" id="hair-color-picker"></div>
+                  </div>
+                  <div class="cc-field">
+                    <label data-i18n="create_eyes">Occhi</label>
+                    <div class="eye-picker-outer" id="eye-picker-wrap"></div>
+                  </div>
+                </div>
+                <!-- AI mode -->
+                <div id="avatar-ai-panel" style="display:none">
+                  <div class="cc-field">
+                    <label data-i18n="ai_describe_label">✨ Descrivi il tuo calciatore</label>
+                    <textarea id="ai-avatar-prompt" rows="3"
+                      placeholder="es: capelli ricci neri, occhi verdi, carnagione scura"
+                      style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:0.84rem;resize:none;font-family:inherit;box-sizing:border-box"
+                      onfocus="this.style.borderColor='var(--gold)'" onblur="this.style.borderColor='var(--border)'"></textarea>
+                    <button type="button" id="ai-generate-btn" onclick="generateAIAvatar()" class="btn-primary" style="width:100%;margin-top:8px;font-size:0.85rem" data-i18n="ai_generate_btn">🎨 Genera</button>
+                    <p id="ai-status" style="font-size:0.72rem;color:var(--text-dim);text-align:center;margin-top:6px"></p>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+
+            <div class="cc-nav">
+              <button type="button" class="cc-btn-back" onclick="ccGoStep(1)" data-i18n="cc_back">← Indietro</button>
+              <button type="button" class="cc-btn-next" onclick="ccNextStep(2)" data-i18n="cc_next">Avanti →</button>
+            </div>
+          </div>
+
+          <!-- STEP 3: Stile di gioco -->
+          <div class="cc-panel" id="cc-step-3">
+            <div class="cc-panel-header">
+              <div class="cc-panel-icon">🦶</div>
+              <div>
+                <h3 data-i18n="cc_step3_title">Il tuo stile</h3>
+                <p data-i18n="cc_step3_sub">Come giochi in campo?</p>
+              </div>
+            </div>
+
+            <div class="cc-fields">
+              <div class="cc-field">
+                <label data-i18n="create_foot">Piede Preferito</label>
+                <div class="cc-toggle-group" id="foot-toggle">
+                  <button type="button" class="cc-toggle active" data-val="dx" onclick="ccSetFoot('dx')" data-i18n="foot_right">👟 Destro</button>
+                  <button type="button" class="cc-toggle" data-val="sx" onclick="ccSetFoot('sx')" data-i18n="foot_left">👟 Sinistro</button>
+                </div>
+                <input type="hidden" id="c-piede-preferito" value="dx">
+              </div>
+
+              <div class="cc-field">
+                <label data-i18n="cc_role">Ruolo / Specializzazione</label>
+                <p class="cc-field-hint" data-i18n="cc_role_hint">+5 alla stat principale a inizio carriera</p>
+                <div class="cc-role-grid" id="cc-role-grid"></div>
+                <input type="hidden" id="c-role" value="bomber">
+              </div>
+            </div>
+
+            <div class="cc-nav">
+              <button type="button" class="cc-btn-back" onclick="ccGoStep(2)" data-i18n="cc_back">← Indietro</button>
+              <button type="button" class="cc-btn-next" onclick="ccNextStep(3)" data-i18n="cc_next">Avanti →</button>
+            </div>
+          </div>
+
+          <!-- STEP 4: Conferma -->
+          <div class="cc-panel" id="cc-step-4">
+            <div class="cc-panel-header">
+              <div class="cc-panel-icon">🌟</div>
+              <div>
+                <h3 data-i18n="cc_step4_title">Pronto per la gloria?</h3>
+                <p data-i18n="cc_step4_sub">Controlla i tuoi dettagli e inizia</p>
+              </div>
+            </div>
+
+            <!-- Summary card -->
+            <div class="cc-summary-card">
+              <div class="cc-summary-avatar" id="cc-summary-avatar"></div>
+              <div class="cc-summary-info">
+                <div class="cc-summary-name" id="cc-summary-name">—</div>
+                <div class="cc-summary-career" id="cc-summary-career">—</div>
+                <div class="cc-summary-tags" id="cc-summary-tags"></div>
+              </div>
+            </div>
+
+            <p class="error-msg" id="create-error" style="margin:8px 0 0"></p>
+
+            <div class="cc-nav cc-nav-final">
+              <button type="button" class="cc-btn-back" onclick="ccGoStep(3)" data-i18n="cc_back">← Indietro</button>
+              <button type="button" class="cc-btn-start" onclick="doCreateCareer()" data-i18n="create_start_btn">🌟 Inizia la Carriera!</button>
+            </div>
+          </div>
+
+        </div><!-- cc-wizard -->
+      </div><!-- create-career-box -->
+
+
+    </div><!-- fine auth-container -->
+  </div>
+</div>
+
+<!-- ========== DASHBOARD PAGE ========== -->
+<div id="dashboard-page" class="page">
+    <div style="height:calc(100vh - 52px);display:flex;flex-direction:column;max-width:1400px;margin:0 auto;padding:0 24px;box-sizing:border-box">
+        <div class="player-hero">
+            <div class="player-avatar">
+                <span id="player-avatar-icon">👦</span>
+            </div>
+            <div class="player-info">
+                <h2 id="player-name-display">-</h2>
+                <div class="subtitle" id="player-subtitle">-</div>
+                <div class="team-badge">🏟️ <span id="player-team">-</span></div>
+                <button type="button" onclick="if(window.GS_PlayerCard&&currentPlayer)GS_PlayerCard.showCardModal(currentPlayer)" 
+                        style="margin-top:6px;background:rgba(255,215,0,0.1);border:1px solid rgba(255,215,0,0.3);color:var(--gold);padding:4px 10px;border-radius:20px;cursor:pointer;font-size:0.72rem;font-weight:700;transition:all 0.2s"
+                        onmouseover="this.style.background='rgba(255,215,0,0.2)'" onmouseout="this.style.background='rgba(255,215,0,0.1)'">
+                    🃏 <span data-i18n="view_card">Carta</span>
+                </button>
+            </div>
+            <div class="player-overall">
+                <div class="overall-circle" id="overall-circle">
+                    <span class="overall-value" id="overall-value">-</span>
+                </div>
+                <div class="overall-label">OVR / 125</div>
+            </div>
+        </div>
+
+        <div class="info-cards">
+            <div class="info-card"><div class="val" id="info-mese">-</div><div class="lbl" data-i18n="dash_period">Periodo</div></div>
+            <div class="info-card"><div class="val" id="info-soldi">-</div><div class="lbl" data-i18n="dash_money">Soldi</div></div>
+            <div class="info-card"><div class="val" id="info-gol">-</div><div class="lbl" data-i18n="dash_goals">⚽ Gol Stagione</div></div>
+            <div class="info-card"><div class="val" id="info-assist">-</div><div class="lbl" data-i18n="dash_assists">🎯 Assist Stagione</div></div>
+            <div class="info-card"><div class="val" id="info-struttura">-</div><div class="lbl" data-i18n="dash_facility">Struttura</div></div>
+        </div>
+
+        <div class="dashboard-main-layout">
+            <div class="dashboard-left" style="overflow-y:auto;padding-right:4px">
+                <div id="dashboard-obiettivi" style="margin-bottom:20px"></div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3 data-i18n="dash_tech_stats">📊 Statistiche Tecniche</h3>
+                        <div class="stat-row" data-stat="tiro" title="Max: 125"><span class="stat-name" data-i18n="stat_tiro">Tiro</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row" data-stat="velocita" title="Max: 125"><span class="stat-name" data-i18n="stat_velocita">Velocità</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row" data-stat="dribbling" title="Max: 125"><span class="stat-name" data-i18n="stat_dribbling">Dribbling</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row" data-stat="fisico" title="Max: 125"><span class="stat-name" data-i18n="stat_fisico">Fisico</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row" data-stat="mentalita" title="Max: 125"><span class="stat-name" data-i18n="stat_mentalita">Mentalità</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div style="border-top:1px solid var(--border);margin:10px 0 8px 0"></div>
+                        <div id="piede-forte-row" style="display:flex;align-items:center;justify-content:space-between;padding:3px 0;font-size:0.85rem">
+                          <span style="color:var(--text-dim)" data-i18n="stat_piede_forte">🦶 Piede Forte</span>
+                          <span id="info-piede-forte" style="color:var(--gold);letter-spacing:1px">—</span>
+                        </div>
+                        <div id="piede-debole-row" style="display:flex;align-items:center;justify-content:space-between;padding:3px 0;font-size:0.85rem">
+                          <span style="color:var(--text-dim)" data-i18n="stat_piede_debole">🦶 Piede Debole</span>
+                          <span id="info-piede-debole" style="color:#a0c4ff;letter-spacing:1px">—</span>
+                        </div>
+                        <div style="display:flex;align-items:center;justify-content:space-between;padding:3px 0;font-size:0.85rem">
+                          <span style="color:var(--text-dim)" data-i18n="stat_skill_lvl">🎯 Livello Skill</span>
+                          <span id="info-livello-skill" style="color:#b8f5b0;letter-spacing:1px">—</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="dash_phys_cond">🔋 Condizione Fisica</h3>
+                        <div class="stat-row bar-green" data-special="energia"><span class="stat-name" data-i18n="stat_energia">Energia</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row bar-blue" data-special="morale"><span class="stat-name" data-i18n="stat_morale">Morale</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                        <div class="stat-row bar-purple" data-special="popolarita"><span class="stat-name" data-i18n="stat_popolarita">Popolarità</span><div class="stat-bar-bg"><div class="stat-bar" style="width:0%"></div></div><span class="stat-value">0</span></div>
+                    </div>
+                </div>
+            </div>
+            <div class="dashboard-right">
+                <div class="dash-notizie-box">
+                    <div class="dash-notizie-header">
+                        <span data-i18n="dash_latest_news">📰 Ultime Notizie</span>
+                        <span id="dash-news-unread" class="news-badge" style="display:none"></span>
+                    </div>
+                    <div id="dash-notizie-lista"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ========== GAME PAGE ========== -->
+<div id="game-page" class="page">
+    <div id="game-page-inner" style="padding:24px;max-width:1400px;margin:0 auto;position:relative">
+        <div style="position:relative;z-index:1">
+        <div class="page-title" data-i18n="page_game">⚽ Gioca il Mese</div>
+        <p class="page-subtitle" data-i18n="game_play_sub">Scegli fino a 3 azioni per questo mese, poi simula le partite</p>
+        <div class="month-indicator">
+            <div class="month-dots" id="month-dots"></div>
+            <span id="current-month-text" style="font-size:0.9rem;color:var(--text-dim)"></span>
+        </div>
+        <div class="game-layout">
+            <div class="actions-panel">
+                <h3 data-i18n="game_choose_actions">🎮 Scegli le tue Azioni</h3>
+                <p data-i18n="game_choose_sub">Seleziona 1-3 azioni mensili. Le scelte influenzano stats, energia e performance.</p>
+                <div class="actions-grid" id="actions-grid"></div>
+                <button type="button" class="play-btn" id="play-month-btn" disabled>⚽ Seleziona azioni</button>
+            </div>
+            <div class="game-sidebar">
+                <div class="sidebar-card">
+                    <h4 data-i18n="dash_current_status">📈 Status Attuale</h4>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                        <div class="info-card" style="padding:12px"><div class="val" id="g-overall">-</div><div class="lbl" data-i18n="attr_overall">Overall</div></div>
+                        <div class="info-card" style="padding:12px"><div class="val" id="g-energia">-</div><div class="lbl" data-i18n="stat_energia">Energia</div></div>
+                        <div class="info-card" style="padding:12px"><div class="val" id="g-morale">-</div><div class="lbl" data-i18n="stat_morale">Morale</div></div>
+                        <div class="info-card" style="padding:12px"><div class="val" id="g-soldi">-</div><div class="lbl" data-i18n="dash_money">Soldi</div></div>
+                    </div>
+                </div>
+                <div class="sidebar-card">
+                    <h4 data-i18n="dash_activities">📋 Ultime Attività</h4>
+                    <ul class="log-list" id="recent-log"><li class="log-item" style="color:var(--text-dim)" data-i18n="loading">⏳ Caricamento...</li></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div></div>
+
+<!-- ========== CAREER PAGE ========== -->
+<div id="career-page" class="page">
+    <div style="padding:24px;max-width:1200px;margin:0 auto">
+        <div class="page-title" data-i18n="page_career">📊 Carriera</div>
+        <p class="page-subtitle" data-i18n="career_subtitle">Storico delle tue stagioni — clicca su un anno per i dettagli</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+            <div>
+                <div id="career-analytics-dash"></div>
+            </div>
+            <div>
+                <div id="career-wld-pie" style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px">
+                    <div style="font-size:0.72rem;font-weight:800;color:var(--gold);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">📊 W/L/D</div>
+                </div>
+            </div>
+        </div>
+        <div style="margin-bottom:24px">
+            <div style="font-size:0.72rem;font-weight:800;color:var(--gold);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">📅 Timeline</div>
+            <div id="career-timeline-wrap" style="max-height:400px;overflow-y:auto;padding-right:4px"></div>
+        </div>
+        <div class="tabs" style="margin-bottom:12px">
+            <button type="button" class="tab active" id="career-tab-seasons" onclick="switchCareerTab('seasons')" data-i18n="career_tab_seasons">📅 Stagioni</button>
+            <button type="button" class="tab" id="career-tab-log" onclick="switchCareerTab('log')" data-i18n="career_tab_log">📋 Log Partite</button>
+        </div>
+        <div id="career-seasons-list"><p class="loading" data-i18n="loading">Caricamento</p></div>
+        <div id="career-log-container" style="display:none"></div>
+    </div>
+</div>
+
+<!-- ========== TRANSFER PAGE ========== -->
+<div id="transfer-page" class="page">
+    <div style="padding:24px;max-width:1200px;margin:0 auto">
+        <div class="page-title" data-i18n="page_transfer">🔄 Trasferimento</div>
+        <p class="page-subtitle" data-i18n="transfer_subtitle">Scegli la tua prossima squadra. Squadre migliori = più soldi e visibilità!</p>
+        <div class="teams-grid" id="teams-grid"><p class="loading" data-i18n="loading_teams">Caricamento squadre</p></div>
+    </div>
+</div>
+
+<!-- ========== STRUTTURE PAGE ========== -->
+<div id="strutture-page" class="page">
+    <div style="padding:24px;max-width:900px;margin:0 auto">
+        <div class="page-title" data-i18n="page_strutture">🏗️ Struttura Personale</div>
+        <p class="page-subtitle" data-i18n="strutture_subtitle">Investi i tuoi soldi per migliorare la tua struttura di allenamento e crescere più velocemente.</p>
+        <div id="strutture-container"><p class="loading" data-i18n="loading">Caricamento</p></div>
+    </div>
+</div>
+
+<!-- ========== CLASSIFICA PAGE ========== -->
+<div id="classifica-page" class="page">
+    <div style="padding:24px;max-width:1200px;margin:0 auto">
+        <div class="page-title" data-i18n="page_classifica">🏟️ Classifica</div>
+        <p class="page-subtitle" data-i18n="classifica_subtitle">Classifica in tempo reale di ogni lega e Champions Cup</p>
+        <div class="classifica-tabs">
+            <button type="button" class="class-tab active" onclick="switchClassTab('lega')" data-i18n="tab_lega">📋 Lega</button>
+            <button type="button" class="class-tab" onclick="switchClassTab('champions')" data-i18n="tab_champions">🏆 Champions Cup</button>
+            <button type="button" class="class-tab" onclick="switchClassTab('capocannonieri')" data-i18n="tab_capocannonieri">👟 Capocannonieri</button>
+            <button type="button" class="class-tab" onclick="switchClassTab('calendario')" data-i18n="tab_calendario">📅 Calendario</button>
+        </div>
+        <div id="class-tab-lega">
+            <div class="lega-filters" id="classifica-lega-filters"><p class="loading" data-i18n="loading_leagues">Caricamento leghe...</p></div>
+            <div id="classifica-table-wrap"><p class="loading" data-i18n="select_league">Seleziona una lega</p></div>
+        </div>
+        <div id="class-tab-champions" style="display:none">
+            <div id="champions-wrap"><p class="loading" data-i18n="loading_champions">Caricamento Champions Cup...</p></div>
+        </div>
+        <div id="class-tab-capocannonieri" style="display:none">
+            <div id="capocannonieri-wrap"><p class="loading" data-i18n="loading">Caricamento...</p></div>
+        </div>
+        <div id="class-tab-calendario" style="display:none">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+                <div id="sc-projection-container"></div>
+                <div id="sc-heatmap-container"></div>
+            </div>
+            <div id="sc-calendar-container"><p class="loading" data-i18n="loading">Caricamento...</p></div>
+        </div>
+    </div>
+</div>
+
+<!-- ========== AGENTE PAGE ========== -->
+<div id="agente-page" class="page">
+    <div style="padding:24px;max-width:900px;margin:0 auto">
+        <div class="page-title" data-i18n="page_agente">🤝 Agente Personale</div>
+        <p class="page-subtitle" data-i18n="agente_subtitle">Un buon agente negozia stipendi migliori e porta offerte dai top club</p>
+        <div id="agente-current" style="margin-bottom:24px"></div>
+        <div id="agente-lista"></div>
+    </div>
+</div>
+
+<!-- ========== NOTIZIE PAGE ========== -->
+<div id="notizie-page" class="page">
+    <div style="padding:24px;max-width:900px;margin:0 auto">
+        <div class="page-title" data-i18n="page_notizie">📰 Notizie</div>
+        <p class="page-subtitle" data-i18n="notizie_subtitle">Gli ultimi aggiornamenti sulla tua carriera</p>
+        <div id="notizie-lista"></div>
+    </div>
+</div>
+
+<!-- ========== SKILL TREE PAGE ========== -->
+<div id="skilltree-page" class="page">
+    <div style="padding:24px;max-width:1100px;margin:0 auto">
+        <div class="page-title" data-i18n="page_skilltree">🌟 Albero delle Abilità</div>
+        <p class="page-subtitle" data-i18n="skilltree_subtitle">Raggiungi milestone nelle statistiche per ottenere punti abilità e sbloccare potenziamenti unici</p>
+
+        <!-- Punti disponibili banner -->
+        <div class="st-points-banner" id="st-points-banner">
+            <span class="st-points-icon">💎</span>
+            <span id="st-points-label" data-i18n="skill_pts_zero">0 punti abilità disponibili</span>
+        </div>
+
+        <!-- Piede forte / debole info -->
+        <div id="st-piede-panel" style="background:var(--bg3);border-radius:10px;padding:12px;margin-bottom:14px;display:flex;gap:16px;flex-wrap:wrap">
+          <div style="flex:1;min-width:120px">
+            <div style="color:var(--text-dim);font-size:0.75rem;margin-bottom:3px" data-i18n="st_strong_foot">🦶 PIEDE FORTE</div>
+            <div id="st-piede-forte-val" style="color:var(--gold);font-size:1rem">⭐⭐⭐☆☆ (3/5)</div>
+            <div style="color:var(--text-dim);font-size:0.7rem;margin-top:3px" data-i18n="st_strong_hint">Potenzia con: Tiro Potente, Tiro a Giro, Rabona</div>
+          </div>
+          <div style="flex:1;min-width:120px">
+            <div style="color:var(--text-dim);font-size:0.75rem;margin-bottom:3px" data-i18n="st_weak_foot">🦶 PIEDE DEBOLE</div>
+            <div id="st-piede-debole-val" style="color:#a0c4ff;font-size:1rem">⭐⭐☆☆☆ (2/5)</div>
+            <div style="color:var(--text-dim);font-size:0.7rem;margin-top:3px" data-i18n="st_weak_hint">Potenzia con: Freddezza, Istinto del Goleador</div>
+          </div>
+          <div style="flex:1;min-width:120px">
+            <div style="color:var(--text-dim);font-size:0.75rem;margin-bottom:3px" data-i18n="st_skill_lvl">🎯 LIVELLO SKILL</div>
+            <div id="st-livello-skill-val" style="color:#b8f5b0;font-size:1rem">⭐⭐☆☆☆ (2/5)</div>
+            <div style="color:var(--text-dim);font-size:0.7rem;margin-top:3px" data-i18n="st_skill_hint">Sale sbloccando più abilità nell'albero</div>
+          </div>
+        </div>
+
+        <!-- Tab per ogni stat -->
+        <div class="st-tabs" id="st-tabs"></div>
+
+        <!-- Contenuto skill tree della stat selezionata -->
+        <div id="st-content"></div>
+    </div>
+</div>
+
+<!-- ========== RESULTS MODAL ========== -->
+<div class="modal-overlay" id="results-modal">
+    <div class="modal modal-results"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="results-modal-title">
+        <h3 id="results-modal-title" data-i18n="results_title">📊 Risultati del Mese</h3>
+        <div class="result-list" id="results-list"></div>
+        <button type="button" class="modal-close" id="close-results" data-i18n="results_close">✅ Continua</button>
+    </div>
+</div>
+
+<!-- ========== MODAL RITIRO / FINE CARRIERA ========== -->
+<div class="modal-overlay" id="retirement-modal" style="z-index:9998">
+    <div class="modal retirement-box"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="retirement-title">
+        <div id="retirement-content"></div>
+        <button type="button" class="modal-close" id="close-retirement" onclick="closeRetirement()" data-i18n="retirement_close">🏠 Torna alle carriere</button>
+    </div>
+</div>
+
+<!-- ========== FIRST-LAUNCH LANGUAGE PICKER ========== -->
+<div class="modal-overlay" id="lang-onboard-modal" style="z-index:10000;display:none">
+    <div class="modal lang-onboard-box" role="dialog" aria-modal="true" aria-labelledby="lang-onboard-title">
+        <div class="lang-onboard-logo">⚽</div>
+        <h2 id="lang-onboard-title" class="lang-onboard-title">Golden Striker</h2>
+        <p class="lang-onboard-sub">Scegli la lingua · Choose your language · Sprache wählen · Elige tu idioma</p>
+        <div class="lang-onboard-grid">
+            <button type="button" class="lang-onboard-opt" onclick="chooseOnboardLang('it')">
+                <span class="lang-onboard-flag">🇮🇹</span><span class="lang-onboard-name">Italiano</span>
+            </button>
+            <button type="button" class="lang-onboard-opt" onclick="chooseOnboardLang('en')">
+                <span class="lang-onboard-flag">🇬🇧</span><span class="lang-onboard-name">English</span>
+            </button>
+            <button type="button" class="lang-onboard-opt" onclick="chooseOnboardLang('de')">
+                <span class="lang-onboard-flag">🇩🇪</span><span class="lang-onboard-name">Deutsch</span>
+            </button>
+            <button type="button" class="lang-onboard-opt" onclick="chooseOnboardLang('es')">
+                <span class="lang-onboard-flag">🇪🇸</span><span class="lang-onboard-name">Español</span>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- ========== MODAL RICHIEDI UPDATE ========== -->
+<div class="modal-overlay" id="update-request-modal" style="z-index:9999">
+    <div class="modal" style="max-width:500px;width:90%"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="update-request-title">
+        <h3 id="update-request-title" style="color:var(--gold);margin:0 0 6px 0" data-i18n="settings_feedback">💡 Richiedi un Update</h3>
+        <p style="color:var(--text-dim);font-size:0.82rem;margin:0 0 14px 0" data-i18n="update_request_desc">Scrivi le tue idee, suggerimenti o segnalazioni. Verranno inviate agli sviluppatori.</p>
+        <textarea id="update-request-text"
+            placeholder="Es: Vorrei che si potesse scegliere la formazione, oppure aggiungere modalità torneo..."
+            style="width:100%;min-height:130px;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:0.88rem;resize:vertical;box-sizing:border-box;font-family:inherit"></textarea>
+        <p class="error-msg" id="update-request-error" style="margin:6px 0 0"></p>
+        <p id="update-request-ok" style="color:#4caf50;font-size:0.85rem;margin:6px 0 0;display:none" data-i18n="update_sent_ok">✅ Richiesta inviata! Grazie per il tuo suggerimento.</p>
+        <div style="display:flex;gap:10px;margin-top:14px">
+            <button type="button" class="btn-primary" onclick="sendUpdateRequest()" style="flex:1" data-i18n="update_send_btn">📨 Invia</button>
+            <button type="button" onclick="closeUpdateRequest()" style="flex:1;background:transparent;border:1px solid var(--border);color:var(--text-dim);padding:10px;border-radius:8px;cursor:pointer" data-i18n="btn_cancel">Annulla</button>
+        </div>
+    </div>
+</div>
+
+<!-- ========== ACHIEVEMENTS PAGE ========== -->
+<div id="achievements-page" class="page">
+    <div style="padding:24px;max-width:1100px;margin:0 auto">
+        <div class="page-title" data-i18n="page_achievements">🏅 Obiettivi Sbloccati</div>
+        <p class="page-subtitle" data-i18n="achievements_subtitle">Completa sfide per sbloccare badge esclusivi</p>
+        <div class="ach-progress-bar" style="margin-bottom:20px">
+            <div class="ach-progress-fill" id="ach-progress-fill" style="width:0%"></div>
+        </div>
+        <div style="color:var(--text-dim);font-size:0.82rem;margin-bottom:20px">
+            <span id="ach-count">0</span> / <span id="ach-total">0</span> <span data-i18n="achievements_unlocked">sbloccati</span>
+        </div>
+        <div id="achievements-grid" class="ach-grid"></div>
+    </div>
+</div>
+
+<!-- Sound toggle -->
+
+<!-- Page flash overlay -->
+<div id="gs-page-overlay"></div>
+
+<script src="js/ui_components.js?v=1774012391" defer></script>
+<script src="js/playercard.js?v=1774012391" defer></script>
+<script src="js/timeline.js?v=1774012391" defer></script>
+<script src="js/analytics.js?v=1774012391" defer></script>
+<script src="js/locale.js?v=1774012391" defer></script>
+<script src="js/encyclopedia.js?v=1774012391" defer></script>
+<script src="js/season_planner.js?v=1774012391" defer></script>
+
+<script src="js/tutorial.js?v=1774012391" defer></script>
+<script src="js/gamedata.js?v=1774012391" defer></script>
+<script src="js/particles.js?v=1774012391" defer></script>
+<script src="js/achievements.js?v=1774012391" defer></script>
+<script src="js/commentary.js?v=1774012391" defer></script>
+<script src="js/charts.js?v=1774012391" defer></script>
+<script src="js/app.js?v=1774012391" defer></script>
+</body>
+</html>

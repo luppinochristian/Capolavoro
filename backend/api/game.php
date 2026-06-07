@@ -1,0 +1,2968 @@
+<?php
+/**
+ * ============================================================
+ * game.php — Motore di gioco principale
+ * ============================================================
+ * Il file più grande del progetto. Gestisce tutta la logica
+ * di simulazione mensile della carriera del giocatore:
+ *
+ *  - play_month: avanza di un mese (allenamento, partite, notizie,
+ *                infortuni, morale, stipendio, Pallone d'Oro, epilogo)
+ *  - buy_struttura: acquisto strutture di allenamento
+ *  - change_team: trasferimento tra squadre
+ *  - apply_skill_boost: sblocco abilità dall'Albero delle Abilità
+ *  - get_skill_boosts: recupero abilità attive del giocatore
+ *
+ * Funzioni chiave:
+ *  - simulaGiornataLega(): simula tutte le partite di campionato del mese
+ *  - simulaChampions(): gestisce la Champions Cup (gironi → finale)
+ *  - generaNotizieDinamiche(): genera 400+ template di notizie bilingue
+ *  - calcPalloneDoro(): calcola l'assegnazione del Pallone d'Oro
+ *  - checkPromozioneRetrocessione(): promozione/retrocessione a fine anno
+ *
+ * Tutte le notizie sono bilingue (IT/EN) tramite le funzioni _tn() e _tna().
+ * La lingua viene letta dall'header HTTP X-Lang inviato dal frontend.
+ * ============================================================
+ */
+require_once '../config/db.php';
+
+// Cattura errori fatali e restituisce JSON invece di HTML
+set_exception_handler(function($e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Errore server: ' . $e->getMessage() . ' (L.' . $e->getLine() . ')']);
+    exit;
+});
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    throw new ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
+
+$player_id = getAuthPlayerId();
+if (!$player_id) { echo json_encode(['error' => t('Non autenticato','Not authenticated')]); exit; }
+
+$data = _getCachedBody();
+$action = $data['action'] ?? $_GET['action'] ?? '';
+
+switch ($action) {
+    case 'play_month':      playMonth($player_id, $data);      break;
+    case 'buy_struttura':   buyStruttura($player_id, $data);   break;
+    case 'change_team':     changeTeam($player_id, $data);     break;
+    case 'apply_skill_boost': applySkillBoost($player_id, $data); break;
+    case 'get_skill_boosts':  getSkillBoosts($player_id);         break;
+    default: echo json_encode(['error' => t('Azione non trovata','Action not found')]);
+}
+
+function getPlayerData($id) {
+    $db = getDB();
+    $stmt = $db->prepare("
+        SELECT p.*, t.stelle as team_stelle, t.popolarita as team_pop,
+               t.moltiplicatore_stipendio, t.probabilita_trofeo,
+               t.lega_id, t.nome as team_nome_full, t.ovr as team_ovr,
+               l.nome as lega_nome, l.livello as lega_livello, l.nazione_id,
+               n.nome as nazione_nome
+        FROM players p
+        LEFT JOIN teams t ON p.team_id = t.id
+        LEFT JOIN leghe l ON t.lega_id = l.id
+        LEFT JOIN nazioni n ON l.nazione_id = n.id
+        WHERE p.id = ?
+    ");
+    $stmt->execute([$id]);
+    return $stmt->fetch();
+}
+
+function playMonth($player_id, $data) {
+    $db  = getDB();
+    $p   = getPlayerData($player_id);
+    if (!$p) { echo json_encode(['error' => t('Giocatore non trovato','Player not found')]); return; }
+
+    // --- GUARD 1: carriera già conclusa (ritiro a 38 anni) -------------------
+    // Impedisce di continuare a "giocare" dopo il ritiro.
+    if (intval($p['age']) >= 38) {
+        echo json_encode([
+            'error' => t('La tua carriera è terminata. Inizia una nuova carriera per continuare a giocare.',
+                         'Your career is over. Start a new career to keep playing.',
+                         'Deine Karriere ist beendet. Starte eine neue Karriere, um weiterzuspielen.',
+                         'Tu carrera ha terminado. Inicia una nueva carrera para seguir jugando.'),
+            'fine_carriera' => true,
+            'career_summary' => buildCareerSummary($db, $player_id),
+        ]);
+        return;
+    }
+
+    // --- GUARD 2: rate limiting / anti-replay -------------------------------
+    // Evita che play_month venga chiamato in loop programmaticamente: ogni mese
+    // può essere giocato una sola volta. Confronta l'ultimo log salvato con il
+    // mese/anno corrente del giocatore.
+    $stmt = $db->prepare("SELECT anno, mese, created_at FROM log_mensile
+                          WHERE player_id=? ORDER BY id DESC LIMIT 1");
+    $stmt->execute([$player_id]);
+    $ultimo = $stmt->fetch();
+    if ($ultimo) {
+        // Se l'ultimo log è dello stesso mese/anno del giocatore, il mese è già
+        // stato giocato ma il salvataggio dell'avanzamento non è ancora visibile
+        // (doppio invio / spam): blocca la ripetizione.
+        if (intval($ultimo['anno']) === intval($p['anno_corrente'])
+            && intval($ultimo['mese']) === intval($p['mese_corrente'])) {
+            echo json_encode(['error' => t('Hai già giocato questo mese. Attendi l\'aggiornamento.',
+                                           'You already played this month. Please wait for the update.',
+                                           'Du hast diesen Monat bereits gespielt. Bitte warte auf die Aktualisierung.',
+                                           'Ya has jugado este mes. Espera la actualización.')]);
+            return;
+        }
+        // Throttle minimo: non più di una chiamata ogni 2 secondi (anti-spam).
+        if (!empty($ultimo['created_at'])) {
+            $elapsed = time() - strtotime($ultimo['created_at']);
+            if ($elapsed >= 0 && $elapsed < 2) {
+                echo json_encode(['error' => t('Troppe richieste. Riprova tra un istante.',
+                                               'Too many requests. Try again in a moment.',
+                                               'Zu viele Anfragen. Versuche es gleich erneut.',
+                                               'Demasiadas solicitudes. Inténtalo de nuevo en un momento.')]);
+                return;
+            }
+        }
+    }
+
+    $azioni = $data['azioni'] ?? [];
+    if (empty($azioni) || count($azioni) > 3) {
+        echo json_encode(['error' => t('Scegli da 1 a 3 azioni','Choose 1 to 3 actions')]); return;
+    }
+
+    // --- INFORTUNI REALI: blocca azioni fisiche se infortunato o energia = 0 ---
+    $infortuni_mesi  = intval($p['infortuni_mesi'] ?? 0);
+    $energia_attuale = intval($p['energia'] ?? 0);
+    $azioni_fisiche  = ['allenamento_tiro','allenamento_velocita','dribbling',
+                        'allenamento_fisico','allenamento_speciale'];
+    if ($infortuni_mesi > 0 || $energia_attuale === 0) {
+        foreach ($azioni as $az) {
+            if (in_array($az, $azioni_fisiche)) {
+                if ($infortuni_mesi > 0) {
+                    echo json_encode(['error' => t("Sei infortunato ({$infortuni_mesi} mes" . ($infortuni_mesi === 1 ? 'e' : 'i') . " rimanenti). Puoi solo riposare, allenarti mentalmente o fare attività social.", "You are injured ({$infortuni_mesi} month" . ($infortuni_mesi === 1 ? '' : 's') . " remaining). You can only rest, train mentally or do social activities.")]);
+                } else {
+                    echo json_encode(['error' => t('Energia a zero! Riposati prima di allenarti fisicamente.','Energy at zero! Rest before doing physical training.')]);
+                }
+                return;
+            }
+        }
+    }
+
+    $risultati     = [];
+    $sc            = ['tiro'=>0,'velocita'=>0,'dribbling'=>0,'fisico'=>0,'mentalita'=>0,'popolarita'=>0,'energia'=>0,'morale'=>0];
+    $evento_speciale = '';
+    $bonus         = getBonusStruttura($p['struttura_livello']);
+
+    // Rischio infortuni da bassa energia: base 0%, sale fino a 40% a energia=1
+    // Fisico alto riduce il rischio: ogni 10 punti di fisico sopra 60 = -3%
+    // Struttura riduce ulteriormente tramite riduzione_infortuni
+    $fisico_val       = intval($p['fisico'] ?? 60);
+    $riduzione_fisico = max(0, ($fisico_val - 60) / 10 * 3); // 0-19.5% in base al fisico
+    $pct_rischio_energia = function($en) use ($riduzione_fisico, $bonus) {
+        if ($en >= 30) return 0; // nessun rischio sopra 30
+        // Da 29 a 1: rischio cresce linearmente da 5% a 40%
+        $base = 5 + (29 - $en) * (35 / 28);
+        return max(0, $base - $riduzione_fisico - ($bonus['riduzione_infortuni'] ?? 0));
+    };
+
+    // --- ALLENAMENTI ---
+    foreach ($azioni as $azione) {
+        // Se un infortunio è appena avvenuto in questa sessione, interrompi le azioni fisiche rimanenti
+        if ($infortuni_mesi > intval($p['infortuni_mesi'] ?? 0) && in_array($azione, $azioni_fisiche)) {
+            continue;
+        }
+        // Controlla rischio infortuni da energia bassa (prima del switch)
+        if (in_array($azione, $azioni_fisiche) && $azione !== 'allenamento_speciale') {
+            $en_corrente = max(0, intval($p['energia'] ?? 0) + $sc['energia']); // tiene conto energia già spesa, clampato a 0
+            $rischio_en  = $pct_rischio_energia($en_corrente);
+            if ($rischio_en > 0 && rand(1, 100) <= $rischio_en) {
+                $durata = 1;
+                $infortuni_mesi = $durata;
+                $sc['energia'] -= rand(20, 35);
+                $en_display = max(0, $en_corrente);
+                $risultati[] = t("🚨 INFORTUNIO per stanchezza! Energia troppo bassa ({$en_display}%). Fuori 1 mese!","🚨 INJURY from fatigue! Energy too low ({$en_display}%). Out for 1 month!","🚨 VERLETZUNG durch Erschöpfung! Energie zu niedrig ({$en_display}%). 1 Monat aus!","🚨 LESIÓN por cansancio! Energía demasiado baja ({$en_display}%). ¡Fuera 1 mes!");
+                continue; // salta l'allenamento, già infortunato
+            }
+        }
+        switch ($azione) {
+            case 'allenamento_tiro':
+                $g = rand(1,3) + $bonus['bonus_crescita'] + intval(round(($bonus['bonus_allenamento'] ?? 0) / 2));
+                $sc['tiro'] += $g; $sc['energia'] -= rand(10,20);
+                $risultati[] = t("🎯 Tiro migliorato +{$g}","🎯 Shooting improved +{$g}","🎯 Schuss verbessert +{$g}","🎯 Disparo mejorado +{$g}"); break;
+            case 'allenamento_velocita':
+                $g = rand(1,3) + $bonus['bonus_crescita'] + intval(round(($bonus['bonus_allenamento'] ?? 0) / 2));
+                $sc['velocita'] += $g; $sc['energia'] -= rand(10,20);
+                $risultati[] = t("⚡ Velocità migliorata +{$g}","⚡ Speed improved +{$g}","⚡ Geschwindigkeit verbessert +{$g}","⚡ Velocidad mejorada +{$g}"); break;
+            case 'dribbling':
+                $g = rand(1,3) + $bonus['bonus_crescita'] + intval(round(($bonus['bonus_allenamento'] ?? 0) / 2));
+                $sc['dribbling'] += $g; $sc['energia'] -= rand(10,20);
+                $risultati[] = t("🏃 Dribbling migliorato +{$g}","🏃 Dribbling improved +{$g}","🏃 Dribbling verbessert +{$g}","🏃 Regate mejorado +{$g}"); break;
+            case 'allenamento_fisico':
+                $g = rand(1,3) + $bonus['bonus_crescita'] + intval(round(($bonus['bonus_allenamento'] ?? 0) / 2));
+                $sc['fisico'] += $g; $sc['energia'] -= rand(10,20);
+                $risultati[] = t("💪 Fisico migliorato +{$g}","💪 Physical improved +{$g}","💪 Körperkraft verbessert +{$g}","💪 Físico mejorado +{$g}"); break;
+            case 'allenamento_mentalita':
+                $g = rand(1,3) + $bonus['bonus_crescita'] + intval(round(($bonus['bonus_allenamento'] ?? 0) / 2));
+                $sc['mentalita'] += $g; $sc['energia'] -= rand(8,15);
+                $sc['morale'] += rand(3,7); // allenare la testa migliora anche l'umore
+                $risultati[] = t("🧠 Mentalità migliorata +{$g}","🧠 Mental improved +{$g}","🧠 Mentalität verbessert +{$g}","🧠 Mentalidad mejorada +{$g}"); break;
+            case 'riposo':
+                $r = rand(20,40);
+                $sc['energia'] += $r; $sc['morale'] += rand(5,10);
+                $risultati[] = t("😴 Riposo: +{$r} energia","😴 Rest: +{$r} energy","😴 Ruhe: +{$r} Energie","😴 Descanso: +{$r} energía"); break;
+            case 'social':
+                $pop = rand(2,8) + intval($p['team_stelle'] ?? 1);
+                $sc['popolarita'] += $pop; $sc['morale'] += rand(3,8);
+                $risultati[] = t("📱 Social: +{$pop} popolarità","📱 Social: +{$pop} popularity","📱 Social: +{$pop} Popularität","📱 Social: +{$pop} popularidad"); break;
+            case 'allenamento_speciale':
+                $rischio = rand(1,100) - $bonus['riduzione_infortuni'];
+                if ($rischio > 75) {
+                    $sc['energia'] -= rand(40,60);
+                    $durata_infortunio = rand(1,2);
+                    $infortuni_mesi = $durata_infortunio; // verrà salvato sotto
+                    $risultati[] = t(
+                        "🚨 INFORTUNIO! Sarai fuori per {$durata_infortunio} " . ($durata_infortunio === 1 ? "mese" : "mesi") . "!",
+                        "🚨 INJURY! Out for {$durata_infortunio} month" . ($durata_infortunio === 1 ? "" : "s") . "!",
+                        "🚨 VERLETZUNG! Du fehlst {$durata_infortunio} Monat" . ($durata_infortunio === 1 ? "" : "e") . "!",
+                        "🚨 ¡LESIÓN! Fuera {$durata_infortunio} " . ($durata_infortunio === 1 ? "mes" : "meses") . "!"
+                    );
+                } else {
+                    $g    = rand(3,6) + $bonus['bonus_crescita'];
+                    $keys = ['tiro','velocita','dribbling','fisico','mentalita'];
+                    $k    = $keys[rand(0,4)];
+                    $sc[$k] += $g;
+                    $statLabel = [
+                        'tiro'      => t('Tiro','Shooting','Schuss','Disparo'),
+                        'velocita'  => t('Velocità','Speed','Geschwindigkeit','Velocidad'),
+                        'dribbling' => t('Dribbling','Dribbling','Dribbling','Regate'),
+                        'fisico'    => t('Fisico','Physical','Körper','Físico'),
+                        'mentalita' => t('Mentalità','Mental','Mentalität','Mentalidad'),
+                    ][$k] ?? ucfirst($k);
+                    $risultati[] = t("🔥 Allenamento speciale: +{$g} {$statLabel}","🔥 Special training: +{$g} {$statLabel}","🔥 Spezialtraining: +{$g} {$statLabel}","🔥 Entrenamiento especial: +{$g} {$statLabel}");
+                }
+                break;
+        }
+    }
+
+    // --- AGENTE BONUS ---
+    $agent_bonus = getAgentBonus($db, $player_id);
+
+    // --- SIMULAZIONE GIORNATA DI LEGA (con partite del giocatore) ---
+    $player_skills = getPlayerSkills($db, $player_id);
+    $lega_result = simulaGiornataLega($db, $p, $player_skills);
+    $lega_msgs = $lega_result['msgs'] ?? [];
+    $altre_partite = $lega_result['altre_partite'] ?? [];
+
+    // --- RISCHIO INFORTUNIO IN PARTITA ---------------------------------------
+    // Oltre agli infortuni da allenamento, ora c'è un rischio reale durante le
+    // partite del mese. Probabilità di base 6%, ridotta da fisico alto e dalla
+    // struttura medica, aumentata da energia bassa. Solo se non già infortunato.
+    if ($infortuni_mesi === 0) {
+        $n_partite_mese = count($lega_result['msgs'] ?? []);
+        if ($n_partite_mese > 0) {
+            $en_ora      = max(0, intval($p['energia'] ?? 60) + $sc['energia']);
+            $rischio_match = 6.0;                                   // base 6%
+            $rischio_match += max(0, (50 - $en_ora) * 0.18);        // +fino a ~9% con energia bassa
+            $rischio_match -= max(0, ($fisico_val - 60) / 10 * 1.5);// fisico alto protegge
+            $rischio_match -= ($bonus['riduzione_infortuni'] ?? 0) * 0.35; // staff medico protegge
+            $rischio_match  = max(1.0, min(20.0, $rischio_match));  // tra 1% e 20%
+            if (rand(1, 1000) <= $rischio_match * 10) {
+                $durata_match = (rand(1, 100) <= 70) ? 1 : 2;       // 70% 1 mese, 30% 2 mesi
+                $infortuni_mesi = $durata_match;
+                $sc['morale'] -= rand(8, 16);
+                $tipo_inf = [
+                    t('stiramento muscolare','muscle strain','Muskelzerrung','distensión muscular'),
+                    t('contusione alla caviglia','ankle knock','Knöchelprellung','golpe en el tobillo'),
+                    t('affaticamento al flessore','hamstring fatigue','Oberschenkelermüdung','fatiga en el isquiotibial'),
+                ][rand(0,2)];
+                $risultati[] = t(
+                    "🚑 INFORTUNIO IN PARTITA ({$tipo_inf}): salterai {$durata_match} " . ($durata_match === 1 ? "mese" : "mesi") . "!",
+                    "🚑 MATCH INJURY ({$tipo_inf}): you'll miss {$durata_match} month" . ($durata_match === 1 ? "" : "s") . "!",
+                    "🚑 SPIELVERLETZUNG ({$tipo_inf}): du fehlst {$durata_match} Monat" . ($durata_match === 1 ? "" : "e") . "!",
+                    "🚑 LESIÓN EN PARTIDO ({$tipo_inf}): te perderás {$durata_match} " . ($durata_match === 1 ? "mes" : "meses") . "!"
+                );
+            }
+        }
+    }
+
+    // Usa il match "principale" (primo match del giocatore) per stipendio/morale/popolarità
+    $match = $lega_result['match_principale'] ?? simulateMatch($p, $player_skills);
+    $risultati[]    = "⚽ ".$match['desc'];
+    $sc['popolarita'] += $match['pop_gain'];
+    $sc['morale']     += $match['morale'];
+    // lega_msgs inviati separatamente nel JSON
+
+    // --- NOTIZIE DINAMICHE ---
+    generaNotizieDinamiche($db, $player_id, $p, $match, $lega_result, $player_skills);
+
+    // --- CHAMPIONS CUP (se qualificata) ---
+    $champions_result = simulaChampions($db, $p);
+    if ($champions_result) $risultati[] = $champions_result;
+
+    // --- EVENTO CASUALE (10%) ---
+    if (rand(1,100) <= 10) {
+        $events = [
+            [t('Crisi di forma improvvisa!','Sudden form crisis!','Plötzliche Formkrise!','¡Crisis de forma repentina!'),             'morale',    -15],
+            [t('Sponsor importante ti contatta!','Important sponsor contacts you!','Wichtiger Sponsor kontaktiert dich!','¡Un patrocinador importante te contacta!'), 'popolarita', 10],
+            [t('Il mister ti loda in conferenza stampa!','The coach praises you in the press conference!','Der Trainer lobt dich auf der Pressekonferenz!','¡El entrenador te elogia en la rueda de prensa!'), 'morale', 20],
+            [t('Rivalità con un altro attaccante!','Rivalry with another striker!','Rivalität mit einem anderen Stürmer!','¡Rivalidad con otro delantero!'), 'morale', -5],
+            [t('Offerta da un top club!','Offer from a top club!','Angebot von einem Topklub!','¡Oferta de un club top!'), 'morale', 15],
+        ];
+        $ev = $events[array_rand($events)];
+        $evento_speciale = $ev[0];
+        $sc[$ev[1]] += $ev[2];
+        $risultati[] = t("🎲 EVENTO: ","🎲 EVENT: ","🎲 EREIGNIS: ","🎲 EVENTO: ").$ev[0];
+    }
+
+    // Sponsor academy
+    if ($p['struttura_livello'] >= 7) {
+        $sp = rand(5000,20000);
+        $match['stipendio'] += $sp;
+        $risultati[] = t("🤝 Sponsor Academy: +€","🤝 Academy Sponsor: +€","🤝 Academy-Sponsor: +€","🤝 Patrocinador Academia: +€").number_format($sp);
+    }
+
+    // --- CALCOLA NUOVE STATS ---
+    $ns = [
+        'tiro'       => min(125,max(1,$p['tiro']      +$sc['tiro'])),
+        'velocita'   => min(125,max(1,$p['velocita']  +$sc['velocita'])),
+        'dribbling'  => min(125,max(1,$p['dribbling'] +$sc['dribbling'])),
+        'fisico'     => min(125,max(1,$p['fisico']    +$sc['fisico'])),
+        'mentalita'  => min(125,max(1,$p['mentalita'] +$sc['mentalita'])),
+        'popolarita' => min(100,max(0,$p['popolarita']+$sc['popolarita'])),
+        'energia'    => min(100,max(0,$p['energia']  +$sc['energia'])),
+        'morale'     => min(100,max(0,$p['morale']   +$sc['morale'])),
+    ];
+    if ($p['age'] >= 32) {
+        $decay = ($p['age']-31)*0.3;
+        $ns['velocita'] = max(1,$ns['velocita']-$decay);
+        $ns['fisico']   = max(1,$ns['fisico']  -$decay);
+    }
+
+    $new_overall = intval(($ns['tiro']+$ns['velocita']+$ns['dribbling']+$ns['fisico']+$ns['mentalita'])/5); // max 125
+    $bonus_soldi   = $lega_result['bonus_soldi'] ?? 0;
+    $stipendio_agente = round($match['stipendio'] * ($agent_bonus['bonus_stipendio'] ?? 0));
+    $new_soldi = $p['soldi'] + $match['stipendio'] + $bonus_soldi + $stipendio_agente;
+    if ($stipendio_agente > 0) {
+        $risultati[] = t("🤝 Bonus agente: +€","🤝 Agent bonus: +€","🤝 Agentenbonus: +€","🤝 Bono de agente: +€").number_format($stipendio_agente);
+    }
+    $new_gol     = $p['gol_carriera']    + $match['gol'];
+    $new_assist  = $p['assist_carriera'] + $match['assist'];
+    $new_trofei  = $p['trofei']          + ($lega_result['trofeo'] ?? 0);
+
+    // Guard: correggi mese fuori stagione (7-8 = luglio/agosto, non dovrebbero esistere)
+    $mese_corrente_safe = $p['mese_corrente'];
+    if ($mese_corrente_safe === 7 || $mese_corrente_safe === 8) $mese_corrente_safe = 9;
+
+    $new_mese  = $mese_corrente_safe + 1;
+    $new_anno  = $p['anno_corrente'];
+    $new_age   = $p['age'];
+    $new_infortuni    = intval($p['infortuni_mesi'] ?? 0); // inizializzazione sicura — verrà sovrascritta dai blocchi sotto
+    $pallone_result   = null;
+    $promozione_msg   = null;
+    $champ_finale     = ['messaggi' => [], 'soldi' => 0, 'trofei' => 0, 'champions_win' => false];
+
+    // Wraparound dicembre → gennaio
+    if ($new_mese > 12) $new_mese = 1;
+
+    // --- FINE STAGIONE: giugno (6) → settembre (9) nuova stagione ---
+    // La stagione va da settembre a giugno. Dopo giugno si avanza anno e si salta a settembre.
+    if ($mese_corrente_safe == 6) {
+        $new_mese = 9; // inizio nuova stagione
+        $new_anno++; $new_age++;
+
+        // Idempotency guard: skip year-end rewards if already processed for this anno
+        $year_already_processed = $db->prepare("SELECT id FROM stagioni WHERE player_id=? AND anno=?");
+        $year_already_processed->execute([$player_id, $p['anno_corrente']]);
+        $anno_gia_chiuso = (bool)$year_already_processed->fetch();
+
+        if (!$anno_gia_chiuso) {
+            // Pallone d'Oro
+            $pallone_result = calcPalloneDoro($db, $player_id, $p, $new_overall, $new_gol, $new_assist);
+            $risultati[] = t("📅 Nuova stagione! Età: {$new_age}","📅 New season! Age: {$new_age}","📅 Neue Saison! Alter: {$new_age}","📅 ¡Nueva temporada! Edad: {$new_age}");
+            if ($pallone_result) $risultati[] = $pallone_result['msg'];
+
+            // Premi di fine anno (campionato)
+            $premi = calcPremiCampionato($db, $p, $player_id);
+            foreach ($premi['messaggi'] as $m) $risultati[] = $m;
+            $new_soldi  += $premi['soldi'];
+            $new_trofei += $premi['trofei'];
+
+            // Champions Cup finale
+            $champ_finale = concludiChampions($db, $p, $player_id);
+            foreach ($champ_finale['messaggi'] as $m) $risultati[] = $m;
+            $new_soldi  += $champ_finale['soldi'];
+            $new_trofei += $champ_finale['trofei'];
+        } else {
+            // Anno già processato: skip premi, solo avanza stagione
+            $risultati[] = t("📅 Nuova stagione! Età: {$new_age}","📅 New season! Age: {$new_age}","📅 Neue Saison! Alter: {$new_age}","📅 ¡Nueva temporada! Edad: {$new_age}");
+            $champ_finale = ['messaggi'=>[],'soldi'=>0,'trofei'=>0,'champions_win'=>false];
+        }
+
+        // Promozione / Retrocessione
+        $promo = checkPromozioneRetrocessione($db, $player_id, $p, $new_overall);
+        if ($promo) {
+            $promozione_msg = $promo['msg'];
+            $risultati[]    = $promo['msg'];
+            if (!empty($promo['new_team_id'])) {
+                $db->prepare("UPDATE players SET team_id=? WHERE id=?")->execute([$promo['new_team_id'],$player_id]);
+            }
+        }
+
+        // Reset energia e morale per la nuova stagione (settembre)
+        if (isset($ns['energia']) && $ns['energia'] < 70) {
+            $ns['energia'] = min(100, $ns['energia'] + 30); // parziale recupero
+        }
+        if (isset($ns['morale']) && $ns['morale'] < 60) {
+            $ns['morale'] = min(100, $ns['morale'] + 20); // boost di inizio stagione
+        }
+        // Reset infortuni a inizio nuova stagione (guarigione estiva)
+        $new_infortuni = 0;
+
+        // Reset uso trasferimento per nuova stagione
+        $db->prepare("UPDATE players SET trasferimento_anno=0 WHERE id=?")->execute([$player_id]);
+        // Reset flag Champions Cup premio per nuova stagione
+        $db->prepare("UPDATE players SET champions_premio_pagato=0 WHERE id=?")->execute([$player_id]);
+        // Genera il calendario per la lega corretta (potrebbe essere cambiata dopo promozione/retrocessione)
+        $new_team_row = $db->prepare("SELECT t.lega_id FROM players p JOIN teams t ON p.team_id=t.id WHERE p.id=?");
+        $new_team_row->execute([$player_id]);
+        $new_lega_row = $new_team_row->fetch();
+        $lega_for_calendar = $new_lega_row ? intval($new_lega_row['lega_id']) : intval($p['lega_id']);
+        generaCalendario($db, $lega_for_calendar, $new_anno);
+    }
+
+    // Gestione infortuni: decrementa se era già infortunato, mantieni se appena avvenuto
+    // Se è inizio nuova stagione, $new_infortuni è già stato azzerato nel blocco year-end
+    if ($new_mese !== 9) { // non sovrascrivere il reset estivo
+        $prev_infortuni = intval($p['infortuni_mesi'] ?? 0);
+        if ($prev_infortuni > 0 && $infortuni_mesi === $prev_infortuni) {
+            // Nessun nuovo infortunio questo mese → decrementa di 1
+            $new_infortuni = max(0, $prev_infortuni - 1);
+            if ($new_infortuni === 0) $risultati[] = t("✅ Recupero completato! Sei di nuovo in piena forma.","✅ Recovery complete! You are back to full fitness.","✅ Genesung abgeschlossen! Du bist wieder in Topform.","✅ ¡Recuperación completa! Estás de vuelta al 100%.");
+        } elseif ($infortuni_mesi > $prev_infortuni) {
+            // Nuovo infortunio (o più grave) → prendi il valore più alto
+            $new_infortuni = $infortuni_mesi;
+        } else {
+            $new_infortuni = 0;
+        }
+    }
+
+    // Salva una riga per ogni partita giocata nel mese
+    $stmt_log = $db->prepare("INSERT INTO log_mensile (player_id,anno,mese,azione,risultato,gol,assist,voto,evento_speciale,avv,esito,gf,gs,giornata,competizione) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    foreach ($lega_msgs as $lm) {
+        $stmt_log->execute([
+            $player_id,
+            $p['anno_corrente'],
+            $p['mese_corrente'],
+            implode(',', $azioni),
+            '', // risultato allenamenti solo nel riepilogo
+            intval($lm['player_gol']   ?? 0),
+            intval($lm['player_assist'] ?? 0),
+            floatval($lm['player_voto'] ?? 6.0),
+            '', // evento speciale solo nel riepilogo
+            strval($lm['avv'] ?? ''),
+            strval($lm['esito'] ?? ''),
+            intval($lm['gf'] ?? 0),
+            intval($lm['gs'] ?? 0),
+            intval($lm['giornata'] ?? 0),
+            'lega',
+        ]);
+    }
+    // Riga riepilogo mensile (allenamenti + eventi, gol=0 così non altera le best query)
+    if (empty($lega_msgs)) {
+        // Nessuna partita (es. mese di pausa): salva comunque un record con i dati del match simulato
+        $stmt_log->execute([$player_id,$p['anno_corrente'],$p['mese_corrente'],implode(',',$azioni),implode("\n",$risultati),$match['gol'],$match['assist'],$match['voto'],$evento_speciale,'','',0,0,0,'lega']);
+    } else {
+        // Salva riepilogo allenamenti/eventi separato (non conta nelle best-match query grazie ad avv='__riepilogo')
+        $stmt_log->execute([$player_id,$p['anno_corrente'],$p['mese_corrente'],implode(',',$azioni),implode("\n",$risultati),0,0,0.0,$evento_speciale,'__riepilogo','',0,0,0,'lega']);
+    }
+
+    // Aggiorna giocatore
+    $db->prepare("UPDATE players SET tiro=?,velocita=?,dribbling=?,fisico=?,mentalita=?,popolarita=?,energia=?,morale=?,overall=?,soldi=?,gol_carriera=?,assist_carriera=?,trofei=?,mese_corrente=?,anno_corrente=?,age=?,infortuni_mesi=? WHERE id=?")
+       ->execute([$ns['tiro'],$ns['velocita'],$ns['dribbling'],$ns['fisico'],$ns['mentalita'],$ns['popolarita'],$ns['energia'],$ns['morale'],$new_overall,$new_soldi,$new_gol,$new_assist,$new_trofei,$new_mese,$new_anno,$new_age,$new_infortuni,$player_id]);
+
+    $fine_carriera = false;
+    $career_summary = null;
+    if ($new_age >= 38) {
+        $fine_carriera = true;
+        $career_summary = buildCareerSummary($db, $player_id);
+        $risultati[] = t("🏁 FINE CARRIERA! ","🏁 CAREER OVER! ","🏁 KARRIEREENDE! ","🏁 ¡FIN DE CARRERA! ")
+                     . $career_summary['titolo'] . ' ' . $career_summary['emoji'];
+    }
+
+    echo json_encode([
+        'success'       => true,
+        'risultati'     => $risultati,
+        'match'         => $match,
+        'lega_msgs'     => $lega_msgs,
+        'altre_partite' => $altre_partite,
+        'pallone_doro'  => $pallone_result,
+        'promozione'    => $promozione_msg,
+        'fine_carriera' => $fine_carriera,
+        'career_summary'=> $career_summary,
+        'nuovo_anno'    => ($new_anno !== $p['anno_corrente']),
+        'infortuni_mesi'=> $new_infortuni,
+        'champions_win' => $champ_finale['champions_win'] ?? false,
+    ]);
+}
+
+// NOTIZIE PARTITA AVANZATE — Libreria completa di 200+ template
+// Contiene: notizie di gol con stile, notizie tattiche, 
+// notizie meteorologiche, notizie arbitrali, notizie del mister
+
+function getAdvancedMatchNews($nome, $team, $avv, $pgol, $passist, $pvoto, $esito, $giornata, $gf, $gs, $casa, $skills = []) {
+    $items = [];
+    $scarto = abs($gf - $gs);
+    $isHome = $casa === _tn('in casa','at home','zu Hause','en casa');
+
+    // ── 1. Skill-based goal news ──────────────────────────────────────────────
+    if ($pgol >= 1) {
+        if (isset($skills['tiro_potente']))
+            $items[] = [_tn("💥 Potenza devastante","💥 Devastating power", "💥 Verheerende Wucht", "💥 Potencia devastadora"), _tn("{$nome} fa tremare la traversa con un destro che sfonda la rete. 'Non ho pensato — ho solo calciato con tutto quello che avevo'. Voto {$pvoto}.","{$nome} rattles the crossbar with a right-foot thunderbolt that tears the net apart. 'I didn't think — I just hit it with everything I had'. Rating {$pvoto}.", "{$nome} lässt die Latte erzittern mit einem Rechtsschuss, der das Netz zerreißt. 'Ich habe nicht nachgedacht — ich habe einfach mit aller Kraft geschossen'. Note {$pvoto}.", "{$nome} hace temblar el larguero con un derechazo que rompe la red. 'No pensé — solo golpeé con todo lo que tenía'. Nota {$pvoto}."), "positivo"];
+        if (isset($skills['tiro_giro']))
+            $items[] = [_tn("🌀 Magia con l'esterno","🌀 Outside-of-the-boot magic", "🌀 Magie mit dem Außenrist", "🌀 Magia con el exterior"), _tn("Nemmeno una palla ferma può battere {$nome}: tiro a giro all'incrocio dei pali contro {$avv}. Una firma d'autore. Voto {$pvoto}.","Not even a set-piece can stop {$nome}: a curling strike into the top corner against {$avv}. A trademark finish. Rating {$pvoto}.", "Nicht einmal ein ruhender Ball kann {$nome} stoppen: ein gekrümmter Schuss in den Winkel gegen {$avv}. Eine Künstlersignatur. Note {$pvoto}.", "Ni un balón parado puede con {$nome}: disparo curvo a la escuadra contra {$avv}. Una firma de autor. Nota {$pvoto}."), "positivo"];
+        if (isset($skills['tiro_rabona']))
+            $items[] = [_tn("🎭 RABONA IN PARTITA!","🎭 RABONA IN THE MATCH!", "🎭 RABONA IM SPIEL!", "🎭 ¡RABONA EN PARTIDO!"), _tn("Clamoroso: {$nome} segna con la rabona contro {$avv}! Immagini già virali sui social. Una prodezza che resterà nella storia. Voto {$pvoto}.","Incredible: {$nome} scores with a rabona against {$avv}! Already going viral. A moment of brilliance that will go down in history. Rating {$pvoto}.", "Sensationell: {$nome} trifft mit der Rabona gegen {$avv}! Die Bilder gehen bereits viral. Eine Glanztat für die Geschichtsbücher. Note {$pvoto}.", "Increíble: ¡{$nome} marca con una rabona contra {$avv}! Las imágenes ya son virales. Una proeza que quedará en la historia. Nota {$pvoto}."), "positivo"];
+        if (isset($skills['colpo_testa']))
+            $items[] = [_tn("👑 Re dell'aria","👑 King of the air", "👑 König der Lüfte", "👑 Rey del aire"), _tn("{$nome} non ha rivali in elevazione: colpo di testa imperioso contro {$avv}, il portiere immobile. 'Quel cross era perfetto, ho fatto il mio lavoro.' Voto {$pvoto}.","{$nome} has no rivals in the air: a commanding header against {$avv}, the keeper rooted to the spot. 'The cross was perfect, I just did my job.' Rating {$pvoto}.", "{$nome} ist in der Luft konkurrenzlos: ein gebieterischer Kopfball gegen {$avv}, der Torwart wie angewurzelt. 'Die Flanke war perfekt, ich habe nur meinen Job gemacht.' Note {$pvoto}.", "{$nome} no tiene rival por alto: cabezazo imperioso contra {$avv}, el portero inmóvil. 'Ese centro era perfecto, solo hice mi trabajo.' Nota {$pvoto}."), "positivo"];
+        if (isset($skills['turbo']))
+            $items[] = [_tn("⚡ Velocità della luce","⚡ Speed of light", "⚡ Lichtgeschwindigkeit", "⚡ Velocidad de la luz"), _tn("Passo di gamba, accelerazione bruciante, gol in contropiede: {$nome} lascia i difensori avversari nell'impossibilità di reagire. Voto {$pvoto}.","One step, explosive acceleration, counter-attack goal: {$nome} leaves the defenders with no chance to respond. Rating {$pvoto}.", "Schrittwechsel, brennende Beschleunigung, Konter-Tor: {$nome} lässt den gegnerischen Verteidigern keine Chance zu reagieren. Note {$pvoto}.", "Cambio de paso, aceleración fulgurante, gol al contragolpe: {$nome} deja a los defensores rivales sin opción de reaccionar. Nota {$pvoto}."), "positivo"];
+        if (isset($skills['freddezza']))
+            $items[] = [_tn("🧊 Sangue freddo assoluto","🧊 Ice-cold composure", "🧊 Absolute Kaltblütigkeit", "🧊 Sangre fría absoluta"), _tn("Solo davanti al portiere, {$nome} aspetta, aspetta ancora... poi calcia col piede che vuole. Freddezza soprannaturale contro {$avv}. Voto {$pvoto}.","One-on-one with the keeper, {$nome} waits, waits some more... then picks his spot. Supernatural composure against {$avv}. Rating {$pvoto}.", "Allein vor dem Torwart wartet {$nome}, wartet noch... dann schießt er mit dem Fuß seiner Wahl. Übernatürliche Kaltschnäuzigkeit gegen {$avv}. Note {$pvoto}.", "Solo ante el portero, {$nome} espera, espera más... luego define con el pie que quiere. Frialdad sobrenatural contra {$avv}. Nota {$pvoto}."), "positivo"];
+        if (isset($skills['istinto']))
+            $items[] = [_tn("🎯 Istinto puro","🎯 Pure instinct", "🎯 Reiner Instinkt", "🎯 Instinto puro"), _tn("Non si spiega, si ammira: {$nome} era già in posizione prima che il cross arrivasse. Istinto da goleador puro contro {$avv}. Voto {$pvoto}.","There's no explaining it — only admiring it: {$nome} was already in position before the cross arrived. Pure striker's instinct against {$avv}. Rating {$pvoto}.", "Man kann es nicht erklären, nur bewundern: {$nome} war schon in Position, bevor die Flanke kam. Reiner Torjägerinstinkt gegen {$avv}. Note {$pvoto}.", "No se explica, se admira: {$nome} ya estaba en posición antes de que llegara el centro. Puro instinto goleador contra {$avv}. Nota {$pvoto}."), "positivo"];
+    }
+
+    // ── 2. Tactical news ──────────────────────────────────────────────────────
+    if ($pvoto >= 7.0) {
+        $tattiche = [
+            [_tn("🧩 Lettura tattica perfetta","🧩 Perfect tactical reading", "🧩 Perfektes taktisches Gespür", "🧩 Lectura táctica perfecta"), _tn("L'analista tattico della trasmissione: '{$nome} ha interpretato alla perfezione i movimenti senza palla. Ogni corsa era finalizzata.' Voto {$pvoto}.","The broadcast's tactical analyst: '{$nome} read every off-ball movement to perfection. Every run had a purpose.' Rating {$pvoto}.", "Der Taktikanalyst der Übertragung: '{$nome} hat die Laufwege ohne Ball perfekt interpretiert. Jeder Lauf hatte ein Ziel.' Note {$pvoto}.", "El analista táctico de la transmisión: '{$nome} interpretó a la perfección los movimientos sin balón. Cada carrera tenía un propósito.' Nota {$pvoto}."), "positivo"],
+            [_tn("🗺️ Il mediano che non c'era","🗺️ The midfielder who was everywhere", "🗺️ Der Sechser, der überall war", "🗺️ El mediocampista omnipresente"), _tn("{$nome} ha coperto spazi enormi senza che i compagni se ne rendessero conto. Voto {$pvoto} che non racconta tutto.","{$nome} covered enormous areas without team-mates even noticing. A rating of {$pvoto} that doesn't tell the full story.", "{$nome} hat riesige Räume abgedeckt, ohne dass die Mitspieler es bemerkten. Eine Note {$pvoto}, die nicht alles erzählt.", "{$nome} cubrió espacios enormes sin que sus compañeros se dieran cuenta. Una nota {$pvoto} que no lo cuenta todo."), "positivo"],
+            [_tn("📐 Precisione geometrica","📐 Geometric precision", "📐 Geometrische Präzision", "📐 Precisión geométrica"), _tn("Ogni movimento di {$nome} sembrava calcolato al millimetro. Il mister in panchina: 'Ha eseguito il piano di gioco alla perfezione.' Voto {$pvoto}.","Every movement by {$nome} looked calculated to the millimetre. The coach on the bench: 'He executed the game plan to perfection.' Rating {$pvoto}.", "Jede Bewegung von {$nome} schien auf den Millimeter berechnet. Der Trainer auf der Bank: 'Er hat den Spielplan perfekt umgesetzt.' Note {$pvoto}.", "Cada movimiento de {$nome} parecía calculado al milímetro. El entrenador en el banquillo: 'Ejecutó el plan de juego a la perfección.' Nota {$pvoto}."), "positivo"],
+            [_tn("🔄 Polmone inesauribile","🔄 Inexhaustible engine", "🔄 Unermüdliche Lunge", "🔄 Pulmón inagotable"), _tn("{$nome} ha percorso 12.4 km, terzo nella squadra per chilometraggio. La corsa non tradisce mai. Voto {$pvoto}.","{$nome} covered 12.4 km, third in the team for distance run. Hard work never lies. Rating {$pvoto}.", "{$nome} ist 12,4 km gelaufen, Dritter im Team nach Laufleistung. Der Laufwille trügt nie. Note {$pvoto}.", "{$nome} recorrió 12,4 km, tercero del equipo en kilometraje. La carrera nunca traiciona. Nota {$pvoto}."), "positivo"],
+        ];
+        $items[] = $tattiche[array_rand($tattiche)];
+    }
+
+    // ── 3. Weather/pitch conditions ───────────────────────────────────────────
+    $meteo = [
+        [_tn("🌧️ Pioggia battente","🌧️ Heavy rain", "🌧️ Strömender Regen", "🌧️ Lluvia torrencial"), _tn("La pioggia non ferma {$nome}: condizioni difficili, eppure la sua performance contro {$avv} è stata di alto livello. Voto {$pvoto}.","The rain doesn't stop {$nome}: tough conditions, yet his performance against {$avv} was top class. Rating {$pvoto}.", "Der Regen stoppt {$nome} nicht: schwierige Bedingungen, dennoch war seine Leistung gegen {$avv} hochklassig. Note {$pvoto}.", "La lluvia no detiene a {$nome}: condiciones difíciles, y aun así su actuación contra {$avv} fue de alto nivel. Nota {$pvoto}."), "info"],
+        [_tn("☀️ Sole e belle giocate","☀️ Sun and fine football", "☀️ Sonne und schöner Fußball", "☀️ Sol y buen fútbol"), _tn("Una giornata perfetta per il calcio: {$nome} ha sfruttato le condizioni ottimali per esprimersi al meglio contro {$avv}. Voto {$pvoto}.","A perfect day for football: {$nome} made the most of the ideal conditions to express himself against {$avv}. Rating {$pvoto}.", "Ein perfekter Tag für Fußball: {$nome} nutzte die optimalen Bedingungen, um sich gegen {$avv} bestmöglich zu entfalten. Note {$pvoto}.", "Un día perfecto para el fútbol: {$nome} aprovechó las condiciones óptimas para expresarse al máximo contra {$avv}. Nota {$pvoto}."), "info"],
+        [_tn("💨 Vento fastidioso","💨 Annoying wind", "💨 Lästiger Wind", "💨 Viento molesto"), _tn("Con il vento che rendeva difficile il gioco aereo, {$nome} ha saputo adattarsi magnificamente. Voto {$pvoto}.","With the wind making aerial play difficult, {$nome} adapted magnificently. Rating {$pvoto}.", "Bei Wind, der das Luftspiel erschwerte, wusste sich {$nome} hervorragend anzupassen. Note {$pvoto}.", "Con el viento dificultando el juego aéreo, {$nome} supo adaptarse magníficamente. Nota {$pvoto}."), "info"],
+        [_tn("❄️ Freddo polare","❄️ Freezing cold", "❄️ Eisige Kälte", "❄️ Frío polar"), _tn("Temperature rigide, ma {$nome} è rimasto concentrato per tutti i 90 minuti contro {$avv}. Voto {$pvoto}.","Bitter temperatures, but {$nome} remained focused for all 90 minutes against {$avv}. Rating {$pvoto}.", "Eisige Temperaturen, doch {$nome} blieb über die gesamten 90 Minuten gegen {$avv} konzentriert. Note {$pvoto}.", "Temperaturas gélidas, pero {$nome} se mantuvo concentrado los 90 minutos contra {$avv}. Nota {$pvoto}."), "info"],
+        [_tn("🌫️ Nebbia fitta","🌫️ Thick fog", "🌫️ Dichter Nebel", "🌫️ Niebla densa"), _tn("Serata nebbiosa allo stadio — eppure {$nome} ha trovato il modo di brillare contro {$avv}. Voto {$pvoto}.","A foggy evening at the stadium — yet {$nome} found a way to shine against {$avv}. Rating {$pvoto}.", "Nebliger Abend im Stadion — dennoch fand {$nome} einen Weg, gegen {$avv} zu glänzen. Note {$pvoto}.", "Noche de niebla en el estadio — y aun así {$nome} encontró la forma de brillar contra {$avv}. Nota {$pvoto}."), "info"],
+    ];
+    if (rand(1, 100) <= 30) $items[] = $meteo[array_rand($meteo)];
+
+    // ── 4. Referee news ───────────────────────────────────────────────────────
+    if (rand(1, 100) <= 25) {
+        $arbitro = [
+            [_tn("🟨 Giallo contestato","🟨 Disputed yellow card", "🟨 Umstrittene Gelbe Karte", "🟨 Amarilla protestada"), _tn("Ammonizione contestata per {$nome}: 'Non ho toccato nessuno' — le sue parole a fine partita. Decisione che ha fatto discutere.","Disputed booking for {$nome}: 'I didn't touch anyone' — his words at full time. A decision that sparked debate.", "Umstrittene Verwarnung für {$nome}: 'Ich habe niemanden berührt' — seine Worte nach dem Spiel. Eine Entscheidung, die für Diskussionen sorgte.", "Amonestación protestada para {$nome}: 'No toqué a nadie' — sus palabras al final del partido. Una decisión que dio que hablar."), "negativo"],
+            [_tn("📺 VAR protagonista","📺 VAR takes centre stage", "📺 VAR im Mittelpunkt", "📺 El VAR protagonista"), _tn("Il VAR entra in scena durante {$team}-{$avv}: due minuti di attesa, poi la decisione che cambia la partita. {$nome} resta freddo.","VAR intervenes during {$team}-{$avv}: two minutes of waiting, then the decision that changes the match. {$nome} stays calm.", "Der VAR tritt während {$team}-{$avv} in Aktion: zwei Minuten Wartezeit, dann die spielentscheidende Entscheidung. {$nome} bleibt cool.", "El VAR entra en escena durante {$team}-{$avv}: dos minutos de espera, luego la decisión que cambia el partido. {$nome} se mantiene frío."), "info"],
+            [_tn("🟥 Rosso all'avversario","🟥 Opposition red card", "🟥 Rote Karte für den Gegner", "🟥 Roja para el rival"), _tn("L'avversario diretto di {$nome} viene espulso: vantaggio numerico che il {$team} sfrutta nel finale.","{$nome}'s direct opponent is sent off: a numerical advantage that {$team} exploit in the closing stages.", "Der direkte Gegenspieler von {$nome} wird vom Platz gestellt: numerische Überzahl, die {$team} in der Schlussphase nutzt.", "El rival directo de {$nome} es expulsado: ventaja numérica que {$team} aprovecha en el tramo final."), "positivo"],
+            [_tn("⚖️ Arbitro contestato","⚖️ Referee under fire", "⚖️ Schiedsrichter in der Kritik", "⚖️ Árbitro cuestionado"), _tn("Fischio finale contestato da entrambe le squadre — ma i dati statistici danno ragione a {$nome}: dominante per 90 minuti.","The final whistle contested by both sides — but the stats back {$nome}: dominant for 90 minutes.", "Der Schlusspfiff von beiden Mannschaften beanstandet — doch die Statistik gibt {$nome} recht: dominant über 90 Minuten.", "Pitido final protestado por ambos equipos — pero las estadísticas dan la razón a {$nome}: dominante durante 90 minutos."), "info"],
+        ];
+        $items[] = $arbitro[array_rand($arbitro)];
+    }
+
+    // ── 5. Coach news ─────────────────────────────────────────────────────────
+    $mister = [
+        [_tn("🎙️ Il mister in conferenza","🎙️ Coach speaks out", "🎙️ Der Trainer auf der Pressekonferenz", "🎙️ El entrenador en rueda de prensa"), _tn("'Siamo soddisfatti. {$nome} ha fatto quello che gli chiedevo e anche di più.' — parole del tecnico nel post-partita contro {$avv}.","'We're satisfied. {$nome} did what I asked of him and more.' — the coach's words after the match against {$avv}.", "'Wir sind zufrieden. {$nome} hat getan, was ich verlangt habe, und mehr.' — Worte des Trainers nach dem Spiel gegen {$avv}.", "'Estamos satisfechos. {$nome} hizo lo que le pedía y más.' — palabras del técnico tras el partido contra {$avv}."), "positivo"],
+        [_tn("📋 Piano gara rispettato","📋 Game plan executed", "📋 Spielplan umgesetzt", "📋 Plan de partido cumplido"), _tn("Il tecnico del {$team} elogia la squadra: 'Abbiamo eseguito il piano alla perfezione. E {$nome} è stato fondamentale nell'interpretarlo.' Voto {$pvoto}.","The {$team} coach praises the squad: 'We executed the plan to perfection. And {$nome} was key to interpreting it.' Rating {$pvoto}.", "Der Trainer von {$team} lobt das Team: 'Wir haben den Plan perfekt umgesetzt. Und {$nome} war entscheidend bei der Umsetzung.' Note {$pvoto}.", "El técnico del {$team} elogia al equipo: 'Ejecutamos el plan a la perfección. Y {$nome} fue fundamental para interpretarlo.' Nota {$pvoto}."), "positivo"],
+        [_tn("🔄 Cambio tattico vincente","🔄 Winning tactical switch", "🔄 Erfolgreicher taktischer Wechsel", "🔄 Cambio táctico ganador"), _tn("Il mister cambia il modulo al 60°: {$nome} si trova nuove libertà e ne approfitta subito. La flessibilità paga. Voto {$pvoto}.","The coach changes shape at 60 minutes: {$nome} finds new freedom and takes advantage immediately. Flexibility pays. Rating {$pvoto}.", "Der Trainer ändert das System in der 60.: {$nome} findet neue Freiheiten und nutzt sie sofort. Flexibilität zahlt sich aus. Note {$pvoto}.", "El técnico cambia el sistema al minuto 60: {$nome} encuentra nuevas libertades y las aprovecha al instante. La flexibilidad paga. Nota {$pvoto}."), "positivo"],
+        [_tn("🤔 Mister insoddisfatto","🤔 Coach not satisfied", "🤔 Unzufriedener Trainer", "🤔 Entrenador insatisfecho"), _tn("'Potevamo fare di più' — il tecnico non nasconde l'insoddisfazione nonostante il {$gf}-{$gs}. {$nome} sa che deve fare meglio.","'We could have done more' — the coach makes no secret of his dissatisfaction despite the {$gf}-{$gs}. {$nome} knows he must improve.", "'Wir hätten mehr tun können' — der Trainer verbirgt seine Unzufriedenheit trotz des {$gf}-{$gs} nicht. {$nome} weiß, dass er es besser machen muss.", "'Podíamos hacer más' — el técnico no oculta su insatisfacción pese al {$gf}-{$gs}. {$nome} sabe que debe mejorar."), "info"],
+    ];
+    $items[] = $mister[array_rand($mister)];
+
+    // ── 6. League context news ────────────────────────────────────────────────
+    if ($giornata > 0) {
+        $contesto = [
+            [_tn("📊 Classifica marcatori","📊 Top scorers chart", "📊 Torjägerliste", "📊 Tabla de goleadores"), _tn("Dopo la G{$giornata}, {$nome} si conferma tra i primi cinque marcatori della lega con i suoi gol in stagione. La classifica dice tutto.","After GW{$giornata}, {$nome} confirms his place among the top five scorers in the league this season. The table says it all.", "Nach dem {$giornata}. Spieltag bestätigt sich {$nome} mit seinen Saisontoren unter den fünf besten Torschützen der Liga. Die Tabelle sagt alles.", "Tras la J{$giornata}, {$nome} se confirma entre los cinco máximos goleadores de la liga con sus goles esta temporada. La tabla lo dice todo."), "positivo"],
+            [_tn("🏟️ Giornata {$giornata}","🏟️ Gameweek {$giornata}", "🏟️ {$giornata}. Spieltag", "🏟️ Jornada {$giornata}"), _tn("Alla G{$giornata} di campionato, {$team} e {$avv} danno vita a un confronto che entra nella storia della stagione. {$nome} è ancora protagonista.","In GW{$giornata} of the season, {$team} and {$avv} produce a contest that will go down in the season's history. {$nome} is the star again.", "Am {$giornata}. Spieltag liefern sich {$team} und {$avv} ein Duell, das in die Geschichte der Saison eingeht. {$nome} ist erneut der Protagonist.", "En la J{$giornata} de liga, {$team} y {$avv} protagonizan un duelo que entra en la historia de la temporada. {$nome} vuelve a ser protagonista."), "info"],
+            [_tn("📈 Rendimento costante","📈 Consistent performance", "📈 Konstante Leistung", "📈 Rendimiento constante"), _tn("La G{$giornata} conferma la continuità di rendimento di {$nome}: terza prestazione di alta qualità di fila. I numeri non mentono.","GW{$giornata} confirms {$nome}'s consistency: a third high-quality performance in a row. The numbers don't lie.", "Der {$giornata}. Spieltag bestätigt die Leistungskonstanz von {$nome}: dritte hochwertige Vorstellung in Folge. Die Zahlen lügen nicht.", "La J{$giornata} confirma la regularidad de {$nome}: tercera actuación de alto nivel consecutiva. Los números no mienten."), "positivo"],
+        ];
+        if (rand(1, 100) <= 40) $items[] = $contesto[array_rand($contesto)];
+    }
+
+    // ── 7. Season phase news ──────────────────────────────────────────────────
+    if ($giornata >= 30) {
+        $items[] = [_tn("🏁 Rush finale","🏁 Final push", "🏁 Schlussspurt", "🏁 Recta final"), _tn("Siamo nelle ultime giornate — ogni punto vale doppio. {$nome} lo sa e alza ulteriormente il livello. Voto {$pvoto}.","We're in the final stretch — every point counts double. {$nome} knows it and raises his level even further. Rating {$pvoto}.", "Wir sind in den letzten Spieltagen — jeder Punkt zählt doppelt. {$nome} weiß das und legt noch eine Schippe drauf. Note {$pvoto}.", "Estamos en las últimas jornadas — cada punto vale doble. {$nome} lo sabe y sube aún más el nivel. Nota {$pvoto}."), "positivo"];
+    } elseif ($giornata <= 5) {
+        $items[] = [_tn("🌱 Avvio di stagione","🌱 Season opener", "🌱 Saisonstart", "🌱 Inicio de temporada"), _tn("Le prime giornate sono fondamentali per impostare la rotta. {$nome} parte subito con ambizioni alte. Voto {$pvoto}.","The opening gameweeks are crucial for setting the tone. {$nome} starts immediately with high ambitions. Rating {$pvoto}.", "Die ersten Spieltage sind entscheidend, um den Kurs zu setzen. {$nome} startet sofort mit hohen Ambitionen. Note {$pvoto}.", "Las primeras jornadas son clave para marcar el rumbo. {$nome} arranca de inmediato con grandes ambiciones. Nota {$pvoto}."), "info"];
+    }
+
+    // ── 8. Match-specific news ────────────────────────────────────────────────
+    if ($scarto >= 4 && $esito === 'V')
+        $items[] = [_tn("💪 Goleada storica!","💪 Historic thrashing!", "💪 Historischer Kantersieg!", "💪 ¡Goleada histórica!"), _tn("Un {$gf}-{$gs} da incorniciare: {$team} travolge {$avv} con una prestazione da manuale. {$nome} tra i più brillanti. Voto {$pvoto}.","A framing-worthy {$gf}-{$gs}: {$team} overwhelms {$avv} with a textbook display. {$nome} among the brightest. Rating {$pvoto}.", "Ein {$gf}-{$gs} zum Einrahmen: {$team} überrollt {$avv} mit einer Vorstellung wie aus dem Lehrbuch. {$nome} unter den Glänzendsten. Note {$pvoto}.", "Un {$gf}-{$gs} para enmarcar: {$team} arrolla a {$avv} con una actuación de manual. {$nome} entre los más brillantes. Nota {$pvoto}."), "positivo"];
+    if ($scarto === 0 && $pgol >= 1)
+        $items[] = [_tn("🤝 Segna ma non basta","🤝 Goal not enough", "🤝 Trifft, aber es reicht nicht", "🤝 Marca pero no basta"), _tn("La firma di {$nome} non è sufficiente per i tre punti: {$gf}-{$gs} finale. 'Sono soddisfatto del gol, meno del risultato.' Voto {$pvoto}.","The {$nome} stamp is not enough for three points: {$gf}-{$gs} at the end. 'I'm happy with the goal, less so with the result.' Rating {$pvoto}.", "Die Signatur von {$nome} reicht nicht für drei Punkte: {$gf}-{$gs} am Ende. 'Mit dem Tor bin ich zufrieden, mit dem Ergebnis weniger.' Note {$pvoto}.", "La firma de {$nome} no basta para los tres puntos: {$gf}-{$gs} final. 'Estoy satisfecho con el gol, menos con el resultado.' Nota {$pvoto}."), "info"];
+    if ($esito === 'S' && $pgol >= 2)
+        $items[] = [_tn("😔 Doppietta vana","😔 Brace in vain", "😔 Vergeblicher Doppelpack", "😔 Doblete en vano"), _tn("{$nome} segna due reti ma {$team} cede ancora: {$gf}-{$gs} il finale. 'Ho fatto la mia parte, il resto della squadra dovrà fare di più.' Voto {$pvoto}.","{$nome} scores twice but {$team} slip up again: {$gf}-{$gs} the final score. 'I did my part, the rest of the squad will need to do more.' Rating {$pvoto}.", "{$nome} erzielt zwei Tore, doch {$team} verliert erneut: {$gf}-{$gs} am Ende. 'Ich habe meinen Teil getan, der Rest des Teams muss mehr leisten.' Note {$pvoto}.", "{$nome} marca dos goles pero {$team} vuelve a caer: {$gf}-{$gs} final. 'Hice mi parte, el resto del equipo deberá hacer más.' Nota {$pvoto}."), "negativo"];
+    if ($isHome && $esito === 'V')
+        $items[] = [_tn("🏟️ Imbattibile in casa","🏟️ Unstoppable at home", "🏟️ Zu Hause unbesiegbar", "🏟️ Invencible en casa"), _tn("{$team} vince ancora tra le mura amiche contro {$avv}: {$gf}-{$gs}. {$nome} si nutre dell'energia del proprio pubblico. Voto {$pvoto}.","{$team} win again at home against {$avv}: {$gf}-{$gs}. {$nome} feeds off the energy of his own fans. Rating {$pvoto}.", "{$team} gewinnt erneut im eigenen Stadion gegen {$avv}: {$gf}-{$gs}. {$nome} schöpft Energie aus dem eigenen Publikum. Note {$pvoto}.", "{$team} vuelve a ganar en casa contra {$avv}: {$gf}-{$gs}. {$nome} se alimenta de la energía de su afición. Nota {$pvoto}."), "positivo"];
+    if (!$isHome && $esito === 'V')
+        $items[] = [_tn("✈️ Magia in trasferta","✈️ Away day magic", "✈️ Auswärtszauber", "✈️ Magia a domicilio"), _tn("Vincere in casa avversaria non è da tutti: {$team} lo fa contro {$avv} ({$gf}-{$gs}). {$nome} trascina la squadra lontano dalle mura amiche. Voto {$pvoto}.","Winning away from home is no easy feat: {$team} do it against {$avv} ({$gf}-{$gs}). {$nome} drags the team to victory on the road. Rating {$pvoto}.", "Auswärts zu gewinnen ist nicht jedem vergönnt: {$team} schafft es gegen {$avv} ({$gf}-{$gs}). {$nome} reißt das Team fernab der Heimat mit. Note {$pvoto}.", "Ganar como visitante no es para todos: {$team} lo logra contra {$avv} ({$gf}-{$gs}). {$nome} arrastra al equipo lejos de casa. Nota {$pvoto}."), "positivo"];
+
+    if (!empty($items)) {
+        shuffle($items);
+        return array_slice($items, 0, 2);
+    }
+    return [];
+}
+
+// NOTIZIE ESTESE — Pool supplementare di notizie dinamiche
+// Chiamata da generaNotizieDinamiche per varietà aggiuntiva
+function getExtraNewsPool($nome, $team, $avv, $pgol, $passist, $pvoto, $esito, $overall, $pop, $stelle, $anno, $mese) {
+    $pool = [];
+    $gf_label = $pgol > 0
+        ? "{$pgol} " . _tn('gol','goals','Tore','goles')
+        : ($passist > 0 ? "{$passist} assist" : _tn('una prestazione solida','a solid performance','eine solide Leistung','una actuación sólida'));
+
+    // Rating-based news
+    if ($pvoto >= 9.0) {
+        $pool[] = [_tn("⭐ Prestazione da 10","⭐ Perfect 10 performance", "⭐ Leistung der Note 1", "⭐ Actuación de 10"), _tn("Partita stellare di {$nome} contro {$avv}: voto {$pvoto} che fa riflettere. Quando è in questa forma, è semplicemente inarrestabile.","Stellar match by {$nome} against {$avv}: rating {$pvoto}. When he's in this form, he's simply unstoppable.", "Sternstunde von {$nome} gegen {$avv}: eine Note {$pvoto}, die nachdenklich macht. Wenn er in dieser Form ist, ist er schlicht unaufhaltsam.", "Partido estelar de {$nome} contra {$avv}: nota {$pvoto} que hace reflexionar. Cuando está en esta forma, es sencillamente imparable."), "positivo"];
+        $pool[] = [_tn("🌟 MVP indiscusso","🌟 Undisputed MVP", "🌟 Unbestrittener MVP", "🌟 MVP indiscutible"), _tn("{$nome} eletto MVP della partita dai tifosi e dalla stampa dopo il {$pvoto} contro {$avv}. 'Una delle migliori performance che ricordi', scrive il quotidiano sportivo.","{$nome} voted match MVP by fans and press after the {$pvoto} rating against {$avv}. 'One of the best performances I can remember', writes the sports paper.", "{$nome} von Fans und Presse zum MVP des Spiels gewählt nach der {$pvoto} gegen {$avv}. 'Eine der besten Leistungen, an die ich mich erinnere', schreibt die Sportzeitung.", "{$nome} elegido MVP del partido por la afición y la prensa tras el {$pvoto} contra {$avv}. 'Una de las mejores actuaciones que recuerdo', escribe el diario deportivo."), "positivo"];
+        $pool[] = [_tn("🎖️ Voto da campione","🎖️ Champion's rating", "🎖️ Note eines Champions", "🎖️ Nota de campeón"), _tn("Nemmeno i critici più severi possono dire nulla sul {$pvoto} di {$nome} contro {$avv}. Una prestazione enciclopedica.","Even the harshest critics have nothing to say about {$nome}'s {$pvoto} against {$avv}. An encyclopaedic performance.", "Selbst die strengsten Kritiker können nichts gegen die {$pvoto} von {$nome} gegen {$avv} sagen. Eine enzyklopädische Leistung.", "Ni los críticos más severos pueden decir nada del {$pvoto} de {$nome} contra {$avv}. Una actuación enciclopédica."), "positivo"];
+    } elseif ($pvoto >= 8.0) {
+        $pool[] = [_tn("👏 Ottima partita","👏 Great game", "👏 Großartiges Spiel", "👏 Gran partido"), _tn("{$nome} chiude la partita contro {$avv} con un {$pvoto} che fa felice il mister. Contributo prezioso alla causa.","{$nome} wraps up the match against {$avv} with a {$pvoto} that pleases the coach. A valuable contribution to the cause.", "{$nome} beendet das Spiel gegen {$avv} mit einer {$pvoto}, die den Trainer freut. Ein wertvoller Beitrag zur Sache.", "{$nome} cierra el partido contra {$avv} con un {$pvoto} que alegra al técnico. Una contribución valiosa a la causa."), "positivo"];
+        $pool[] = [_tn("📈 In crescita","📈 Growing stronger", "📈 Im Aufschwung", "📈 En progresión"), _tn("Ancora un {$pvoto} per {$nome} contro {$avv}. La continuità è il segreto dei grandi campioni, e lui lo sa bene.","Another {$pvoto} for {$nome} against {$avv}. Consistency is the secret of great champions, and he knows it well.", "Erneut eine {$pvoto} für {$nome} gegen {$avv}. Konstanz ist das Geheimnis der großen Champions, und das weiß er genau.", "Otro {$pvoto} para {$nome} contra {$avv}. La regularidad es el secreto de los grandes campeones, y él lo sabe bien."), "positivo"];
+    } elseif ($pvoto <= 5.0) {
+        $pool[] = [_tn("📉 Giornata no","📉 Off day", "📉 Gebrauchter Tag", "📉 Día para olvidar"), _tn("{$nome} delude contro {$avv}: voto {$pvoto}. Il mister chiede più concentrazione. 'Sa benissimo cosa deve fare', le parole dello staff.","{$nome} disappoints against {$avv}: rating {$pvoto}. The coach demands more focus. 'He knows exactly what he needs to do', says the staff.", "{$nome} enttäuscht gegen {$avv}: Note {$pvoto}. Der Trainer fordert mehr Konzentration. 'Er weiß genau, was er tun muss', so der Staff.", "{$nome} decepciona contra {$avv}: nota {$pvoto}. El técnico pide más concentración. 'Sabe perfectamente lo que debe hacer', dicen desde el cuerpo técnico."), "negativo"];
+        $pool[] = [_tn("😤 Il momento difficile","😤 A tough spell", "😤 Die schwierige Phase", "😤 El momento difícil"), _tn("Capita a tutti: {$nome} ha voto {$pvoto} contro {$avv}. L'importante è la reazione. I campioni si distinguono proprio in questi momenti.","It happens to everyone: {$nome} rated {$pvoto} against {$avv}. The key is the reaction. Champions show their true colours in these moments.", "Es passiert jedem: {$nome} mit Note {$pvoto} gegen {$avv}. Wichtig ist die Reaktion. Champions zeichnen sich gerade in solchen Momenten aus.", "Le pasa a todos: {$nome} con nota {$pvoto} contra {$avv}. Lo importante es la reacción. Los campeones se distinguen justo en estos momentos."), "negativo"];
+    }
+
+    // Goal-scoring news
+    if ($pgol >= 4) {
+        $pool[] = [_tn("🏆 POKER DI GOL!","🏆 FOUR-GOAL HAUL!", "🏆 VIERERPACK!", "🏆 ¡PÓKER DE GOLES!"), _tn("Storico: {$nome} segna 4 reti contro {$avv}. Un risultato che entra nella storia del club e che farà parlare per settimane.","Historic: {$nome} scores 4 goals against {$avv}. A result that enters the club's history books and will be talked about for weeks.", "Historisch: {$nome} erzielt 4 Tore gegen {$avv}. Ein Ergebnis, das in die Klubgeschichte eingeht und wochenlang Gesprächsthema sein wird.", "Histórico: {$nome} marca 4 goles contra {$avv}. Un resultado que entra en la historia del club y del que se hablará durante semanas."), "positivo"];
+        $pool[] = [_tn("🎰 Quattro gol, un mito","🎰 Four goals, a legend", "🎰 Vier Tore, eine Legende", "🎰 Cuatro goles, un mito"), _tn("Quattro volte a segno: {$nome} contro {$avv} ha mostrato al mondo intero perché è tra i più forti. I social impazziscono.","Four times on target: {$nome} against {$avv} showed the world exactly why he's among the best. Social media goes wild.", "Viermal getroffen: {$nome} hat gegen {$avv} der ganzen Welt gezeigt, warum er zu den Besten gehört. Die sozialen Medien drehen durch.", "Cuatro veces al gol: {$nome} contra {$avv} mostró al mundo entero por qué está entre los mejores. Las redes enloquecen."), "positivo"];
+    }
+    if ($pgol >= 2 && $passist >= 1) {
+        $pool[] = [_tn("🔥 Hat-trick con assist","🔥 Goals and assist", "🔥 Tore und Vorlage", "🔥 Goles y asistencia"), _tn("Doppietta più assist: {$nome} ha risolto la partita contro {$avv} praticamente da solo. Voto {$pvoto}. Dominante.","Brace plus assist: {$nome} single-handedly decided the match against {$avv}. Rating {$pvoto}. Dominant.", "Doppelpack plus Vorlage: {$nome} hat das Spiel gegen {$avv} praktisch im Alleingang entschieden. Note {$pvoto}. Dominant.", "Doblete más asistencia: {$nome} resolvió el partido contra {$avv} prácticamente solo. Nota {$pvoto}. Dominante."), "positivo"];
+    }
+
+    // Popularity news
+    if ($pop >= 80) {
+        $pool[] = [_tn("🌍 Icona planetaria","🌍 Global icon", "🌍 Globale Ikone", "🌍 Icono planetario"), _tn("L'agenzia di marketing GlobalSport certifica: {$nome} è il terzo calciatore più cercato sul web questa settimana. Numeri da rockstar.","Marketing agency GlobalSport confirms: {$nome} is the third most searched footballer on the web this week. Rockstar numbers.", "Die Marketingagentur GlobalSport bestätigt: {$nome} ist diese Woche der drittmeistgesuchte Fußballer im Netz. Rockstar-Zahlen.", "La agencia de marketing GlobalSport certifica: {$nome} es el tercer futbolista más buscado en la web esta semana. Cifras de estrella de rock."), "positivo"];
+        $pool[] = [_tn("📺 In prima serata","📺 Prime time", "📺 Zur besten Sendezeit", "📺 En horario estelar"), _tn("Il talk show di punta della televisione nazionale ha dedicato un'intera puntata a {$nome}. 'Il calciatore del decennio', il titolo dell'episodio.","The national TV's flagship talk show dedicated an entire episode to {$nome}. 'The footballer of the decade', the episode title.", "Die Top-Talkshow des nationalen Fernsehens widmete {$nome} eine ganze Folge. 'Der Fußballer des Jahrzehnts', der Titel der Episode.", "El programa estrella de la televisión nacional dedicó un episodio entero a {$nome}. 'El futbolista de la década', el título del episodio."), "positivo"];
+        $pool[] = [_tn("💎 Brand ambassador","💎 Brand ambassador", "💎 Markenbotschafter", "💎 Embajador de marca"), _tn("Un marchio di lusso svizzero ha siglato un accordo con {$nome}. Il giocatore: 'Scelgo solo partner che condividono i miei valori'.","A Swiss luxury brand has signed a deal with {$nome}. The player: 'I only choose partners who share my values'.", "Eine Schweizer Luxusmarke hat einen Vertrag mit {$nome} geschlossen. Der Spieler: 'Ich wähle nur Partner, die meine Werte teilen'.", "Una marca de lujo suiza ha firmado un acuerdo con {$nome}. El jugador: 'Solo elijo socios que compartan mis valores'."), "info"];
+    } elseif ($pop >= 60) {
+        $pool[] = [_tn("📣 La fama cresce","📣 Fame grows", "📣 Der Ruhm wächst", "📣 La fama crece"), _tn("I follower di {$nome} sui social hanno superato il milione: un traguardo che attira sponsor e visibilità internazionale.","{$nome}'s social media followers have passed one million: a milestone that attracts sponsors and international visibility.", "Die Follower von {$nome} in den sozialen Medien haben die Millionengrenze überschritten: ein Meilenstein, der Sponsoren und internationale Sichtbarkeit anzieht.", "Los seguidores de {$nome} en redes superaron el millón: un hito que atrae patrocinadores y visibilidad internacional."), "positivo"];
+        $pool[] = [_tn("🗞️ Sul giornale nazionale","🗞️ National front page", "🗞️ Auf der nationalen Titelseite", "🗞️ En la portada nacional"), _tn("Prima pagina per {$nome} sul più importante quotidiano sportivo del paese. 'Il futuro del calcio italiano è qui'.","Front page for {$nome} in the country's leading sports newspaper. 'The future of football is here'.", "Titelseite für {$nome} in der wichtigsten Sportzeitung des Landes. 'Die Zukunft des Fußballs ist hier'.", "Portada para {$nome} en el diario deportivo más importante del país. 'El futuro del fútbol está aquí'."), "positivo"];
+    } elseif ($pop <= 20) {
+        $pool[] = [_tn("🔭 Sotto i riflettori","🔭 Under the spotlight", "🔭 Im Rampenlicht", "🔭 Bajo los focos"), _tn("Ancora poca visibilità per {$nome}, ma chi lavora bene viene sempre notato. Il consiglio dello staff: 'Continua così, i risultati arriveranno'.","Still limited visibility for {$nome}, but hard work always gets noticed. Staff advice: 'Keep it up, the results will come'.", "Noch wenig Sichtbarkeit für {$nome}, doch wer gut arbeitet, wird stets bemerkt. Der Rat des Staffs: 'Mach weiter so, die Ergebnisse kommen'.", "Aún poca visibilidad para {$nome}, pero quien trabaja bien siempre acaba siendo notado. El consejo del cuerpo técnico: 'Sigue así, los resultados llegarán'."), "info"];
+    }
+
+    // Career year news
+    if ($anno <= 2) {
+        $pool[] = [_tn("🌱 Il giovane leone","🌱 The young lion", "🌱 Der junge Löwe", "🌱 El joven león"), _tn("La stampa lo definisce 'la rivelazione della stagione': {$nome} sta bruciando le tappe con una maturità sorprendente per la sua età.","The press calls him 'the revelation of the season': {$nome} is racing ahead with surprising maturity for his age.", "Die Presse nennt ihn 'die Entdeckung der Saison': {$nome} verbrennt die Etappen mit einer für sein Alter erstaunlichen Reife.", "La prensa lo define 'la revelación de la temporada': {$nome} quema etapas con una madurez sorprendente para su edad."), "positivo"];
+        $pool[] = [_tn("📚 Imparare dal professionismo","📚 Learning from the pros", "📚 Vom Profitum lernen", "📚 Aprender del profesionalismo"), _tn("Il capitano del {$team}: '{$nome} è il talento più serio che ho visto arrivare in questa squadra. Ha fame di imparare e di vincere'.","The {$team} captain: '{$nome} is the most serious talent I've seen arrive at this club. He's hungry to learn and to win'.", "Der Kapitän von {$team}: '{$nome} ist das ernsthafteste Talent, das ich in diesem Team habe ankommen sehen. Er hat Hunger zu lernen und zu gewinnen'.", "El capitán del {$team}: '{$nome} es el talento más serio que he visto llegar a este equipo. Tiene hambre de aprender y de ganar'."), "positivo"];
+    } elseif ($anno >= 8) {
+        $pool[] = [_tn("🎖️ La saggezza del veterano","🎖️ Veteran wisdom", "🎖️ Die Weisheit des Veteranen", "🎖️ La sabiduría del veterano"), _tn("Dopo anni di carriera, {$nome} sa come affrontare i momenti critici. 'L'esperienza vale più di qualsiasi tattica', parola sua.","After years in the game, {$nome} knows how to handle critical moments. 'Experience is worth more than any tactic', his own words.", "Nach Jahren der Karriere weiß {$nome}, wie man kritische Momente meistert. 'Erfahrung ist mehr wert als jede Taktik', seine Worte.", "Tras años de carrera, {$nome} sabe cómo afrontar los momentos críticos. 'La experiencia vale más que cualquier táctica', palabra suya."), "info"];
+        $pool[] = [_tn("🕰️ Ancora affamato","🕰️ Still hungry", "🕰️ Immer noch hungrig", "🕰️ Todavía hambriento"), _tn("Nonostante i traguardi raggiunti, {$nome} conserva intatta la voglia di vincere. 'Non ho ancora detto tutto quello che so fare'.","Despite all he has achieved, {$nome} keeps his hunger to win intact. 'I haven't yet shown everything I can do'.", "Trotz der erreichten Meilensteine bewahrt {$nome} seinen Siegeswillen ungebrochen. 'Ich habe noch nicht alles gezeigt, was ich kann'.", "Pese a los logros alcanzados, {$nome} conserva intactas las ganas de ganar. 'Todavía no he dicho todo lo que sé hacer'."), "positivo"];
+    }
+
+    // Club prestige news
+    if ($stelle >= 5) {
+        $pool[] = [_tn("🏟️ Il peso della maglia","🏟️ The weight of the shirt", "🏟️ Das Gewicht des Trikots", "🏟️ El peso de la camiseta"), _tn("Indossare questa maglia è una responsabilità enorme. {$nome} lo sa: 'Ogni partita è una finale. I tifosi meritano il massimo'.","Wearing this shirt is an enormous responsibility. {$nome} knows it: 'Every match is a final. The fans deserve the best'.", "Dieses Trikot zu tragen ist eine enorme Verantwortung. {$nome} weiß es: 'Jedes Spiel ist ein Finale. Die Fans verdienen das Maximum'.", "Vestir esta camiseta es una responsabilidad enorme. {$nome} lo sabe: 'Cada partido es una final. La afición merece lo máximo'."), "info"];
+        $pool[] = [_tn("💼 Il club ti vuole","💼 The club wants you", "💼 Der Klub will dich", "💼 El club te quiere"), _tn("Il direttore sportivo in conferenza: 'Non parliamo di mercato. {$nome} è intoccabile. Punto.'","The sporting director in conference: 'We're not discussing the market. {$nome} is untouchable. Full stop.'", "Der Sportdirektor auf der Pressekonferenz: 'Wir reden nicht über Transfers. {$nome} ist unantastbar. Punkt.'", "El director deportivo en rueda de prensa: 'No hablamos de mercado. {$nome} es intocable. Punto.'"), "positivo"];
+    } elseif ($stelle <= 2) {
+        $pool[] = [_tn("🚀 Il locomotore della squadra","🚀 The team's engine", "🚀 Die Lokomotive des Teams", "🚀 La locomotora del equipo"), _tn("In un team che non brilla, {$nome} è la luce nel buio. I compagni: 'Senza di lui saremmo già in zona retrocessione'.","In a team that struggles, {$nome} is the light in the dark. Team-mates: 'Without him we'd already be in the relegation zone'.", "In einem Team, das nicht glänzt, ist {$nome} das Licht im Dunkeln. Die Mitspieler: 'Ohne ihn wären wir längst im Abstiegskampf'.", "En un equipo que no brilla, {$nome} es la luz en la oscuridad. Sus compañeros: 'Sin él ya estaríamos en zona de descenso'."), "positivo"];
+        $pool[] = [_tn("⭐ Troppo grande per questa lega?","⭐ Too big for this league?", "⭐ Zu groß für diese Liga?", "⭐ ¿Demasiado grande para esta liga?"), _tn("I numeri parlano chiaro: {$nome} è il giocatore più influente della lega. Quanto ancora resterà a questo livello?","The numbers speak clearly: {$nome} is the most influential player in the league. How much longer will he stay at this level?", "Die Zahlen sprechen eine klare Sprache: {$nome} ist der einflussreichste Spieler der Liga. Wie lange bleibt er noch auf diesem Niveau?", "Los números hablan claro: {$nome} es el jugador más influyente de la liga. ¿Cuánto seguirá en este nivel?"), "info"];
+    }
+
+    // Monthly seasonal news
+    switch ($mese) {
+        case 9:
+            $pool[] = [_tn("🍂 Si apre la stagione","🍂 The season begins", "🍂 Die Saison beginnt", "🍂 Comienza la temporada"), _tn("Primo mese di campionato per {$nome} e {$team}: le aspettative sono alte, il gruppo è carico. 'Quest'anno o mai più', la parola d'ordine.","First month of the season for {$nome} and {$team}: expectations are high, the squad is fired up. 'This year or never', the battle cry.", "Erster Ligamonat für {$nome} und {$team}: die Erwartungen sind hoch, die Mannschaft ist heiß. 'Dieses Jahr oder nie', die Parole.", "Primer mes de liga para {$nome} y {$team}: las expectativas son altas, el grupo está cargado. 'Este año o nunca', la consigna."), "info"];
+            $pool[] = [_tn("📋 Obiettivi dichiarati","📋 Stated goals", "📋 Erklärte Ziele", "📋 Objetivos declarados"), _tn("In conferenza stampa di inizio stagione, {$nome}: 'Voglio segnare almeno 20 gol. È il mio obiettivo minimo'. L'asticella è alta.","At the pre-season press conference, {$nome}: 'I want to score at least 20 goals. That's my minimum target'. The bar is set high.", "Auf der Saisonauftakt-Pressekonferenz, {$nome}: 'Ich will mindestens 20 Tore erzielen. Das ist mein Minimalziel'. Die Latte liegt hoch.", "En la rueda de prensa de inicio de temporada, {$nome}: 'Quiero marcar al menos 20 goles. Es mi objetivo mínimo'. El listón está alto."), "info"];
+            break;
+        case 12:
+            $pool[] = [_tn("🎄 Il regalo di Natale","🎄 The Christmas gift", "🎄 Das Weihnachtsgeschenk", "🎄 El regalo de Navidad"), _tn("Un gol o una bella vittoria prima delle festività: il miglior regalo che {$nome} potesse fare ai tifosi del {$team}.","A goal or a fine win before the holidays: the best gift {$nome} could give to {$team}'s fans.", "Ein Tor oder ein schöner Sieg vor den Feiertagen: das beste Geschenk, das {$nome} den Fans von {$team} machen konnte.", "Un gol o una buena victoria antes de las fiestas: el mejor regalo que {$nome} podía hacer a la afición del {$team}."), "positivo"];
+            $pgol_bilancio = $pgol > 5 ? _tn("Soddisfatto dei gol","Happy with my goals", "Zufrieden mit den Toren", "Satisfecho con los goles") : _tn("Devo fare di più nel girone di ritorno","I need to do more in the second half of the season", "Ich muss in der Rückrunde mehr leisten", "Debo hacer más en la segunda vuelta");
+            $pool[] = [_tn("🏁 Bilancio di metà stagione","🏁 Half-season review", "🏁 Halbzeitbilanz", "🏁 Balance de media temporada"), _tn("A dicembre {$nome} fa i conti: '{$pgol_bilancio}'. Il mister è d'accordo.","In December {$nome} takes stock: '{$pgol_bilancio}'. The coach agrees.", "Im Dezember zieht {$nome} Bilanz: '{$pgol_bilancio}'. Der Trainer stimmt zu.", "En diciembre {$nome} hace cuentas: '{$pgol_bilancio}'. El técnico está de acuerdo."), "info"];
+            break;
+        case 1:
+            $pool[] = [_tn("🌟 Buon anno!","🌟 Happy New Year!", "🌟 Frohes neues Jahr!", "🌟 ¡Feliz año!"), _tn("Nuovo anno, nuovi obiettivi per {$nome}. 'Quest'anno sarà l'anno della svolta definitiva', scrive sui social con una foto dall'allenamento.","New year, new goals for {$nome}. 'This year will be the year of the definitive turning point', he writes on social media with a training photo.", "Neues Jahr, neue Ziele für {$nome}. 'Dieses Jahr wird das Jahr der endgültigen Wende', schreibt er in den sozialen Medien mit einem Trainingsfoto.", "Año nuevo, nuevos objetivos para {$nome}. 'Este año será el del cambio definitivo', escribe en redes con una foto del entrenamiento."), "positivo"];
+            $pool[] = [_tn("❄️ Calcio d'inverno","❄️ Winter football", "❄️ Winterfußball", "❄️ Fútbol de invierno"), _tn("Il freddo non ferma {$nome}: presente e puntuale agli allenamenti mentre fuori nevica. 'Il campione non conosce la stagione', dice il mister.","The cold doesn't stop {$nome}: present and punctual at training while it snows outside. 'A champion doesn't know the season', says the coach.", "Die Kälte stoppt {$nome} nicht: anwesend und pünktlich im Training, während es draußen schneit. 'Ein Champion kennt keine Jahreszeit', sagt der Trainer.", "El frío no detiene a {$nome}: presente y puntual en los entrenamientos mientras nieva afuera. 'El campeón no conoce de estaciones', dice el técnico."), "info"];
+            break;
+        case 5:
+            $pool[] = [_tn("🌸 Finale di stagione","🌸 End of season run-in", "🌸 Saisonfinale", "🌸 Final de temporada"), _tn("Il campionato entra nel vivo del rush finale. {$nome} è pronto: 'Ho conservato energie per questo momento. Adesso arriva il bello'.","The league enters the final stretch. {$nome} is ready: 'I've saved energy for this moment. Now comes the good part'.", "Die Liga geht in den heißen Schlussspurt. {$nome} ist bereit: 'Ich habe Kräfte für diesen Moment gespart. Jetzt kommt das Schöne'.", "La liga entra en el vivo de la recta final. {$nome} está listo: 'He guardado energías para este momento. Ahora llega lo bueno'."), "positivo"];
+            $pool[] = [_tn("⏱️ Conto alla rovescia","⏱️ Countdown", "⏱️ Countdown", "⏱️ Cuenta atrás"), _tn("Mancano poche giornate alla fine. {$nome}: 'Non abbassiamo la guardia. Ogni punto può essere decisivo per la classifica finale'.","Just a few matchdays left. {$nome}: 'We can't drop our guard. Every point could be decisive for the final table'.", "Es sind nur noch wenige Spieltage. {$nome}: 'Wir lassen nicht nach. Jeder Punkt kann für die Abschlusstabelle entscheidend sein'.", "Quedan pocas jornadas para el final. {$nome}: 'No bajamos la guardia. Cada punto puede ser decisivo para la clasificación final'."), "info"];
+            break;
+        case 6:
+            $pool[] = [_tn("🏁 Fine stagione","🏁 Season over", "🏁 Saisonende", "🏁 Fin de temporada"), _tn("La stagione si chiude per {$nome} e {$team}. 'È stato un viaggio incredibile. Adesso ci godiamo le vacanze e poi si riparte più forti di prima'.","The season ends for {$nome} and {$team}. 'It's been an incredible journey. Now we enjoy the holidays and then come back stronger.", "Die Saison endet für {$nome} und {$team}. 'Es war eine unglaubliche Reise. Jetzt genießen wir den Urlaub und dann starten wir stärker als zuvor'.", "La temporada se cierra para {$nome} y {$team}. 'Ha sido un viaje increíble. Ahora disfrutamos las vacaciones y luego volvemos más fuertes que antes'."), "info"];
+            $pool[] = [_tn("☀️ Arrivederci al prossimo anno","☀️ See you next season", "☀️ Auf Wiedersehen nächstes Jahr", "☀️ Hasta el año que viene"), _tn("Stagione finita: {$nome} saluta i tifosi con un post commovente. 'Grazie per avermi sostenuto anche nei momenti difficili. Ci vediamo a settembre'.","Season done: {$nome} says farewell to fans with a moving post. 'Thank you for supporting me even in the difficult moments. See you in September'.", "Saison vorbei: {$nome} verabschiedet sich von den Fans mit einem bewegenden Post. 'Danke, dass ihr mich auch in schweren Momenten unterstützt habt. Wir sehen uns im September'.", "Temporada terminada: {$nome} se despide de la afición con un post emotivo. 'Gracias por apoyarme también en los momentos difíciles. Nos vemos en septiembre'."), "positivo"];
+            break;
+    }
+
+    // Elite overall news
+    if ($overall >= 90) {
+        $pool[] = [_tn("🔝 Il confronto con i grandi","🔝 Compared to the greats", "🔝 Der Vergleich mit den Großen", "🔝 La comparación con los grandes"), _tn("La rivista France Football paragona lo stile di gioco di {$nome} a quello dei più grandi della storia. Un accostamento che fa sognare i tifosi.","France Football magazine compares {$nome}'s style of play to that of the all-time greats. A comparison that makes fans dream.", "Das Magazin France Football vergleicht den Spielstil von {$nome} mit dem der Größten der Geschichte. Ein Vergleich, der die Fans träumen lässt.", "La revista France Football compara el estilo de juego de {$nome} con el de los más grandes de la historia. Una comparación que hace soñar a la afición."), "positivo"];
+        $pool[] = [_tn("🏅 Tra i 10 migliori del mondo","🏅 Top 10 in the world", "🏅 Unter den 10 Besten der Welt", "🏅 Entre los 10 mejores del mundo"), _tn("Il sondaggio annuale di WorldFootball.net piazza {$nome} tra i dieci migliori giocatori del pianeta. 'Devo continuare a spingere', la sua risposta.","WorldFootball.net's annual survey places {$nome} among the ten best players on the planet. 'I have to keep pushing', his response.", "Die jährliche Umfrage von WorldFootball.net platziert {$nome} unter den zehn besten Spielern des Planeten. 'Ich muss weiter Gas geben', seine Antwort.", "La encuesta anual de WorldFootball.net sitúa a {$nome} entre los diez mejores jugadores del planeta. 'Debo seguir empujando', su respuesta."), "positivo"];
+    } elseif ($overall >= 80) {
+        $pool[] = [_tn("📊 Top 50 europeo","📊 European top 50", "📊 Top 50 in Europa", "📊 Top 50 europeo"), _tn("Secondo le statistiche avanzate di un portale specializzato, {$nome} è tra i top 50 giocatori d'Europa per rendimento. La progressione è costante.","According to advanced stats from a specialist website, {$nome} is among the top 50 players in Europe by performance. The progression is constant.", "Laut den fortgeschrittenen Statistiken eines Fachportals gehört {$nome} zu den Top 50 Spielern Europas nach Leistung. Die Entwicklung ist konstant.", "Según las estadísticas avanzadas de un portal especializado, {$nome} está entre los 50 mejores jugadores de Europa por rendimiento. La progresión es constante."), "positivo"];
+    }
+
+    // Character news (always relevant)
+    $carattere = [
+        [_tn("🤺 Mentalità da guerriero","🤺 Warrior mentality", "🤺 Kriegermentalität", "🤺 Mentalidad de guerrero"), _tn("Contro {$avv}, con il risultato in bilico, {$nome} ha preso per mano la squadra. 'Non mollare mai è il mio mantra', le sue parole post-partita.","Against {$avv}, with the result on a knife-edge, {$nome} took the team by the hand. 'Never give up is my mantra', his post-match words.", "Gegen {$avv}, bei offenem Ergebnis, nahm {$nome} das Team an die Hand. 'Niemals aufgeben ist mein Mantra', seine Worte nach dem Spiel.", "Contra {$avv}, con el resultado en el aire, {$nome} tomó las riendas del equipo. 'Nunca rendirse es mi mantra', sus palabras tras el partido."), "positivo"],
+        [_tn("🎯 La firma del campione","🎯 The champion's signature", "🎯 Die Signatur des Champions", "🎯 La firma del campeón"), _tn("Ogni gol di {$nome} ha qualcosa di speciale: c'è sempre qualità nella scelta del tiro, dell'assist, del momento. Non è fortuna. È classe.","Every {$nome} goal has something special: there's always quality in the choice of shot, assist, timing. It's not luck. It's class.", "Jedes Tor von {$nome} hat etwas Besonderes: es steckt immer Qualität in der Wahl des Schusses, der Vorlage, des Moments. Das ist kein Glück. Das ist Klasse.", "Cada gol de {$nome} tiene algo especial: siempre hay calidad en la elección del disparo, de la asistencia, del momento. No es suerte. Es clase."), "positivo"],
+        [_tn("🧩 Il giocatore totale","🧩 The complete player", "🧩 Der komplette Spieler", "🧩 El jugador total"), _tn("Difende, attacca, organizza: {$nome} è il calciatore completo che ogni allenatore sogna di avere in rosa. Il {$team} lo sa bene.","Defends, attacks, organises: {$nome} is the complete player every coach dreams of having in the squad. {$team} know it well.", "Er verteidigt, greift an, organisiert: {$nome} ist der komplette Spieler, von dem jeder Trainer im Kader träumt. {$team} weiß das genau.", "Defiende, ataca, organiza: {$nome} es el futbolista completo que todo entrenador sueña con tener en plantilla. El {$team} lo sabe bien."), "info"],
+        [_tn("🏋️ Il lavoro non mente","🏋️ Hard work never lies", "🏋️ Arbeit lügt nicht", "🏋️ El trabajo no miente"), _tn("Cinquanta cross analizzati, duecento tiri rielaborati: il lavoro di {$nome} in allenamento riflette la sua prestazione in partita. Professionale al 100%.","Fifty crosses analysed, two hundred shots reworked: {$nome}'s training work reflects his match performance. 100% professional.", "Fünfzig analysierte Flanken, zweihundert nachbearbeitete Schüsse: die Arbeit von {$nome} im Training spiegelt seine Leistung im Spiel. Zu 100% professionell.", "Cincuenta centros analizados, doscientos disparos reelaborados: el trabajo de {$nome} en el entrenamiento refleja su actuación en partido. Profesional al 100%."), "info"],
+        [_tn("🌊 Nel flusso della partita","🌊 In the flow of the game", "🌊 Im Spielfluss", "🌊 En el flujo del partido"), _tn("Ci sono giorni in cui {$nome} sembra connesso con il pallone a un livello superiore. Oggi contro {$avv} era uno di quei giorni.","There are days when {$nome} seems connected to the ball on a higher level. Today against {$avv} was one of those days.", "Es gibt Tage, an denen {$nome} mit dem Ball auf einer höheren Ebene verbunden scheint. Heute gegen {$avv} war so ein Tag.", "Hay días en que {$nome} parece conectado con el balón a un nivel superior. Hoy contra {$avv} fue uno de esos días."), "positivo"],
+        [_tn("🎭 Il calciatore e l'artista","🎭 The footballer and the artist", "🎭 Der Fußballer und der Künstler", "🎭 El futbolista y el artista"), _tn("Chi vede giocare {$nome} capisce che il calcio non è solo sport: è espressione, creatività, istinto. Un artista con gli scarpini ai piedi.","Watching {$nome} play, you understand that football is not just sport: it's expression, creativity, instinct. An artist wearing boots.", "Wer {$nome} spielen sieht, versteht, dass Fußball nicht nur Sport ist: es ist Ausdruck, Kreativität, Instinkt. Ein Künstler mit Fußballschuhen.", "Quien ve jugar a {$nome} entiende que el fútbol no es solo deporte: es expresión, creatividad, instinto. Un artista con botas en los pies."), "positivo"],
+        [_tn("🧭 Orientamento tattico","🧭 Tactical awareness", "🧭 Taktische Orientierung", "🧭 Orientación táctica"), _tn("Il mister spiega: 'Ho chiesto a {$nome} di spostarsi più a sinistra. Ha eseguito perfettamente. Ha una comprensione tattica superiore alla media'.","The coach explains: 'I asked {$nome} to move wider left. He executed it perfectly. His tactical understanding is above average'.", "Der Trainer erklärt: 'Ich habe {$nome} gebeten, sich weiter nach links zu bewegen. Er hat es perfekt umgesetzt. Er hat ein überdurchschnittliches taktisches Verständnis'.", "El técnico explica: 'Le pedí a {$nome} que se moviera más a la izquierda. Lo ejecutó perfectamente. Tiene una comprensión táctica superior a la media'."), "info"],
+        [_tn("⚡ Reazione immediata","⚡ Immediate reaction", "⚡ Sofortige Reaktion", "⚡ Reacción inmediata"), _tn("Dopo una partita deludente, {$nome} era il primo ad arrivare il mattino dopo. 'I campioni non nascondono le sconfitte, le usano come carburante'.","After a disappointing match, {$nome} was the first to arrive the next morning. 'Champions don't hide defeats, they use them as fuel'.", "Nach einem enttäuschenden Spiel war {$nome} am nächsten Morgen der Erste. 'Champions verstecken Niederlagen nicht, sie nutzen sie als Treibstoff'.", "Tras un partido decepcionante, {$nome} fue el primero en llegar a la mañana siguiente. 'Los campeones no esconden las derrotas, las usan como combustible'."), "positivo"],
+        [_tn("🔬 Analisi del rendimento","🔬 Performance analysis", "🔬 Leistungsanalyse", "🔬 Análisis de rendimiento"), _tn("Il software di analisi avanzata del club evidenzia: {$nome} crea 2.8 occasioni da gol a partita. Terzo in Europa per questa statistica.","The club's advanced analysis software highlights: {$nome} creates 2.8 goal chances per match. Third in Europe for this statistic.", "Die fortgeschrittene Analysesoftware des Klubs zeigt: {$nome} kreiert 2,8 Torchancen pro Spiel. Dritter in Europa in dieser Statistik.", "El software de análisis avanzado del club destaca: {$nome} crea 2,8 ocasiones de gol por partido. Tercero en Europa en esta estadística."), "info"],
+        [_tn("💪 Forza mentale","💪 Mental strength", "💪 Mentale Stärke", "💪 Fortaleza mental"), _tn("Tre sconfitte di fila non hanno scalfito la determinazione di {$nome}. 'Ho vissuto momenti più difficili. Ne sono sempre uscito più forte'.","Three defeats in a row have not dented {$nome}'s determination. 'I've been through harder times. I've always come out stronger.", "Drei Niederlagen in Folge haben die Entschlossenheit von {$nome} nicht erschüttert. 'Ich habe schwierigere Momente erlebt. Ich bin immer stärker daraus hervorgegangen'.", "Tres derrotas seguidas no han mermado la determinación de {$nome}. 'He vivido momentos más difíciles. Siempre he salido más fuerte'."), "positivo"],
+    ];
+    $pool = array_merge($pool, $carattere);
+
+    shuffle($pool);
+    return array_slice($pool, 0, 3);
+}
+
+// CALENDARIO: genera andata+ritorno per una lega (34 giornate per 18 squadre)
+// Distribuisce le giornate nei 10 mesi di stagione (set→giu)
+function generaCalendario($db, $lega_id, $anno) {
+    // Già generato?
+    $chk = $db->prepare("SELECT COUNT(*) as n FROM calendario WHERE lega_id=? AND anno=?");
+    $chk->execute([$lega_id, $anno]);
+    if ($chk->fetch()['n'] > 0) return;
+
+    $stmt = $db->prepare("SELECT id FROM teams WHERE lega_id=?");
+    $stmt->execute([$lega_id]);
+    $teams = array_column($stmt->fetchAll(), 'id');
+    $n = count($teams);
+    if ($n < 2) return;
+
+    // Round-robin algorithm (circle method)
+    // Se n è dispari aggiungi un "bye"
+    if ($n % 2 !== 0) $teams[] = null;
+    $total = count($teams);
+    $rounds = $total - 1;
+    $matches_per_round = $total / 2;
+
+    $giornate = []; // array of [home_id, away_id]
+    $fixed = $teams[0];
+    $rotating = array_slice($teams, 1);
+
+    for ($r = 0; $r < $rounds; $r++) {
+        $home = $fixed;
+        $away = $rotating[0];
+        if ($home !== null && $away !== null) $giornate[] = [$home, $away];
+        for ($i = 1; $i < $matches_per_round; $i++) {
+            $h = $rotating[$i];
+            $a = $rotating[$total - 2 - $i];
+            if ($h !== null && $a !== null) $giornate[] = [$h, $a];
+        }
+        $rotating = array_merge(array_slice($rotating, -1), array_slice($rotating, 0, -1));
+    }
+
+    // Duplica per ritorno (invertendo home/away)
+    $andata  = $giornate;
+    $ritorno = array_map(fn($m) => [$m[1], $m[0]], $giornate);
+    $tutti   = array_merge($andata, $ritorno); // 34 giornate totali per 18 squadre
+
+    // Distribuzione nei mesi: stagione set(9) ott(10) nov(11) dic(12) gen(1) feb(2) mar(3) apr(4) mag(5) giu(6)
+    $mesi_stagione = [9, 10, 11, 12, 1, 2, 3, 4, 5, 6]; // 10 mesi
+    $numMesi       = count($mesi_stagione);
+
+    // $tutti contiene TUTTE le partite appiattite. Ogni "giornata" ha $matches_per_round partite.
+    // Ricostruiamo le giornate raggruppate per turno.
+    $turni = []; // $turni[turno_idx] = array di match
+    $turno_size = max(1, $matches_per_round); // partite per giornata (min 1 to avoid division by zero)
+    foreach ($tutti as $idx => $match) {
+        $turno_idx = (int)floor($idx / $turno_size);
+        $turni[$turno_idx][] = $match;
+    }
+    $totTurni = count($turni); // es. 34 turni per 18 squadre
+
+    // Distribuzione equa: $perMese turni per mese, ultimi mesi prendono il resto
+    $perMese = (int)floor($totTurni / $numMesi);
+    $resto   = $totTurni % $numMesi;
+
+    $ins = $db->prepare("INSERT IGNORE INTO calendario (lega_id,anno,giornata,mese,home_id,away_id) VALUES(?,?,?,?,?,?)");
+    $giornataNum = 1;
+    $turnoIdx    = 0;
+    for ($mi = 0; $mi < $numMesi; $mi++) {
+        $mese        = $mesi_stagione[$mi];
+        $turniMese   = $perMese + ($mi < $resto ? 1 : 0);
+        for ($t = 0; $t < $turniMese; $t++) {
+            if (!isset($turni[$turnoIdx])) break;
+            foreach ($turni[$turnoIdx] as $match) {
+                $ins->execute([$lega_id, $anno, $giornataNum, $mese, $match[0], $match[1]]);
+            }
+            $giornataNum++;
+            $turnoIdx++;
+        }
+    }
+}
+
+// SIMULA LE PARTITE DEL MESE per la lega del giocatore
+// Returns la partita del giocatore e aggiorna la classifica
+function simulaGiornataLega($db, $p, $player_skills = []) {
+    $team_id  = $p['team_id'];
+    $lega_id  = $p['lega_id'];
+    $anno     = $p['anno_corrente'];
+    $mese     = $p['mese_corrente'];
+    $team_ovr = intval($p['team_ovr'] ?? 65);
+    $match_principale = null;
+
+    // Genera calendario se non esiste
+    generaCalendario($db, $lega_id, $anno);
+
+    // Sanity check: se il mese corrente non ha partite non giocate ma ce ne sono rimaste,
+    // probabilmente il calendario era malformato (vecchio bug). Rigenera e redistribuisci.
+    $chkMese = $db->prepare("SELECT COUNT(*) as n FROM calendario WHERE lega_id=? AND anno=? AND mese=? AND giocata=0");
+    $chkMese->execute([$lega_id, $anno, $mese]);
+    $partiteMeseCount = intval($chkMese->fetch()['n']);
+    $chkTot = $db->prepare("SELECT COUNT(*) as n FROM calendario WHERE lega_id=? AND anno=? AND giocata=0");
+    $chkTot->execute([$lega_id, $anno]);
+    $partiteRimanenti = intval($chkTot->fetch()['n']);
+
+    if ($partiteMeseCount === 0 && $partiteRimanenti > 0) {
+        // Calendario malformato: elimina e rigenera. Azzera anche la classifica
+        // per evitare punti/gol orfani legati alle partite cancellate.
+        $db->prepare("DELETE FROM calendario WHERE lega_id=? AND anno=?")->execute([$lega_id, $anno]);
+        $db->prepare("DELETE FROM classifica WHERE lega_id=? AND anno=?")->execute([$lega_id, $anno]);
+        generaCalendario($db, $lega_id, $anno);
+    }
+
+    // Assicura record classifica per tutta la lega
+    $stmt = $db->prepare("SELECT id, nome, ovr FROM teams WHERE lega_id=?");
+    $stmt->execute([$lega_id]);
+    $tutteLega = $stmt->fetchAll();
+    foreach ($tutteLega as $t) {
+        $db->prepare("INSERT IGNORE INTO classifica (team_id,lega_id,anno) VALUES(?,?,?)")
+           ->execute([$t['id'], $lega_id, $anno]);
+    }
+
+    // Partite del mese corrente per questa lega
+    $stmt = $db->prepare("SELECT * FROM calendario WHERE lega_id=? AND anno=? AND mese=? AND giocata=0 ORDER BY giornata");
+    $stmt->execute([$lega_id, $anno, $mese]);
+    $partiteMese = $stmt->fetchAll();
+
+    $msgs = [];
+    $altre_partite = []; // risultati delle altre partite della lega (feed live)
+
+    foreach ($partiteMese as $partita) {
+        $home_id = intval($partita['home_id']);
+        $away_id = intval($partita['away_id']);
+
+        if ($home_id == $team_id || $away_id == $team_id) {
+            $isHome   = ($home_id == $team_id);
+            $avv_id   = $isHome ? $away_id : $home_id;
+            $avv      = array_values(array_filter($tutteLega, fn($t) => $t['id'] == $avv_id));
+            $avv      = $avv[0] ?? null;
+            $avv_nome = $avv ? $avv['nome'] : 'Avversario';
+            $avv_ovr  = $avv ? intval($avv['ovr']) : 65;
+
+            // Simula la performance del giocatore per questa partita
+            $match_partita = simulateMatch($p, $player_skills);
+            if ($match_principale === null) $match_principale = $match_partita;
+            $voto_giocatore = floatval($match_partita['voto']);
+            $boost = ($voto_giocatore >= 8) ? 5 : (($voto_giocatore <= 5) ? -5 : 0);
+            $bonus_casa = $isHome ? 3 : -2;
+            $diff  = ($team_ovr + $boost + $bonus_casa) - $avv_ovr;
+            $prob  = min(80, max(20, 50 + $diff * 1.5));
+            $rand  = rand(1, 100);
+
+            if ($rand <= $prob) {
+                $esito = 'V'; $punti = 3;
+                $gf = rand(1,4); $gs = rand(0, max(0, $gf-1));
+                $casa_label = $isHome ? '🏠' : '✈️';
+                $pg = min($match_partita['gol'], $gf);
+                $pa_p = min($match_partita['assist'], max(0, $gf - $pg));
+                // Vittoria larga (+2 o più gol di scarto): boost morale extra
+                $diff_gol = $gf - $gs;
+                $match_partita['morale'] += ($diff_gol >= 3) ? 10 : ($diff_gol >= 2 ? 5 : 0);
+                $msgs[] = ['esito'=>'V','label'=>$casa_label,'giornata'=>$partita['giornata'],'avv'=>$avv_nome,'gf'=>$gf,'gs'=>$gs,'punti'=>3,'isHome'=>$isHome,'player_gol'=>$pg,'player_assist'=>$pa_p,'player_voto'=>$match_partita['voto']];
+            } elseif ($rand <= $prob + 15) {
+                $esito = 'P'; $punti = 1;
+                $gf = rand(0,2); $gs = $gf;
+                $pg = min($match_partita['gol'], $gf);
+                $pa_p = min($match_partita['assist'], max(0, $gf - $pg));
+                // Pareggio: voto -0.3 se il giocatore ha segnato (non bastava), morale ridotto
+                if ($pg > 0) {
+                    $match_partita['voto'] = round(max(4.5, $match_partita['voto'] - 0.3), 1);
+                }
+                $match_partita['morale'] = (int)round($match_partita['morale'] * 0.6);
+                $msgs[] = ['esito'=>'P','label'=>'🤝','giornata'=>$partita['giornata'],'avv'=>$avv_nome,'gf'=>$gf,'gs'=>$gs,'punti'=>1,'isHome'=>$isHome,'player_gol'=>$pg,'player_assist'=>$pa_p,'player_voto'=>$match_partita['voto']];
+            } else {
+                $esito = 'S'; $punti = 0;
+                $gf = rand(0,1); $gs = rand(1,4);
+                $pg = min($match_partita['gol'], $gf);
+                $pa_p = min($match_partita['assist'], max(0, $gf - $pg));
+                $diff_gol = $gs - $gf; // scarto subito
+                // Voto: -0.3 base, -0.2 per ogni gol di scarto oltre 1
+                $voto_pen = 0.3 + max(0, ($diff_gol - 1)) * 0.2;
+                $match_partita['voto'] = round(max(4.5, $match_partita['voto'] - $voto_pen), 1);
+                // Morale: penalità extra se scarto >= 2
+                $morale_pen = ($diff_gol >= 2) ? rand(15, 25) : rand(5, 12);
+                $match_partita['morale'] = min(0, $match_partita['morale']) - $morale_pen;
+                $msgs[] = ['esito'=>'S','label'=>'💔','giornata'=>$partita['giornata'],'avv'=>$avv_nome,'gf'=>$gf,'gs'=>$gs,'punti'=>0,'isHome'=>$isHome,'player_gol'=>$pg,'player_assist'=>$pa_p,'player_voto'=>$match_partita['voto']];
+            }
+
+            $v=$esito=='V'?1:0; $pa=$esito=='P'?1:0; $s=$esito=='S'?1:0;
+            $avv_punti = $esito=='S'?3:($esito=='P'?1:0);
+            $avv_v=$esito=='S'?1:0; $avv_pa=$pa; $avv_s=$esito=='V'?1:0;
+
+            $upd = $db->prepare("UPDATE classifica SET punti=punti+?,vittorie=vittorie+?,pareggi=pareggi+?,sconfitte=sconfitte+?,gol_fatti=gol_fatti+?,gol_subiti=gol_subiti+?,partite_giocate=partite_giocate+1 WHERE team_id=? AND anno=?");
+            $upd->execute([$punti,$v,$pa,$s,$gf,$gs,$team_id,$anno]);
+            $upd->execute([$avv_punti,$avv_v,$avv_pa,$avv_s,$gs,$gf,$avv_id,$anno]);
+        } else {
+            $t1 = array_values(array_filter($tutteLega, fn($t) => $t['id'] == $home_id));
+            $t2 = array_values(array_filter($tutteLega, fn($t) => $t['id'] == $away_id));
+            if ($t1 && $t2) {
+                $r = simulaPartita($db, $t1[0], $t2[0], $lega_id, $anno);
+                // Raccoglie il risultato per il feed live della giornata (altre partite della lega)
+                $altre_partite[] = [
+                    'giornata' => intval($partita['giornata']),
+                    'home'     => $t1[0]['nome'],
+                    'away'     => $t2[0]['nome'],
+                    'gf'       => $r['gf1'],
+                    'gs'       => $r['gs1'],
+                ];
+            }
+        }
+
+        $db->prepare("UPDATE calendario SET giocata=1 WHERE id=?")->execute([$partita['id']]);
+    }
+
+    simulaTutteLeLeghe($db, $lega_id, $anno, $mese);
+
+    return ['msgs'=>$msgs,'match_principale'=>$match_principale,'bonus_soldi'=>0,'trofeo'=>0,'altre_partite'=>$altre_partite];
+}
+
+// Simula tutte le leghe tranne quella del giocatore
+function simulaTutteLeLeghe($db, $lega_corrente_id, $anno, $mese) {
+    $leghe = $db->query("SELECT id FROM leghe")->fetchAll();
+    foreach ($leghe as $lega) {
+        $lid = intval($lega['id']);
+        if ($lid == $lega_corrente_id) continue;
+
+        generaCalendario($db, $lid, $anno);
+
+        $stmt = $db->prepare("SELECT id, nome, ovr FROM teams WHERE lega_id=?");
+        $stmt->execute([$lid]);
+        $squadre = $stmt->fetchAll();
+        if (count($squadre) < 2) continue;
+
+        foreach ($squadre as $t) {
+            $db->prepare("INSERT IGNORE INTO classifica (team_id,lega_id,anno) VALUES(?,?,?)")
+               ->execute([$t['id'], $lid, $anno]);
+        }
+
+        $stmt = $db->prepare("SELECT * FROM calendario WHERE lega_id=? AND anno=? AND mese=? AND giocata=0 ORDER BY giornata");
+        $stmt->execute([$lid, $anno, $mese]);
+        $partite = $stmt->fetchAll();
+
+        foreach ($partite as $partita) {
+            $t1 = array_values(array_filter($squadre, fn($t) => $t['id'] == $partita['home_id']));
+            $t2 = array_values(array_filter($squadre, fn($t) => $t['id'] == $partita['away_id']));
+            if ($t1 && $t2) simulaPartita($db, $t1[0], $t2[0], $lid, $anno);
+            $db->prepare("UPDATE calendario SET giocata=1 WHERE id=?")->execute([$partita['id']]);
+        }
+    }
+}
+
+// Simula una singola partita tra due squadre e aggiorna la classifica
+function simulaPartita($db, $t1, $t2, $lega_id, $anno) {
+    $ovr1 = intval($t1['ovr']);
+    $ovr2 = intval($t2['ovr']);
+    [$gf1, $gs1, $p1, $p2, $v1, $v2, $pa1, $pa2, $s1, $s2] = _simulaEsitoForza($ovr1, $ovr2, true);
+
+    $upd = $db->prepare("UPDATE classifica SET punti=punti+?,vittorie=vittorie+?,pareggi=pareggi+?,sconfitte=sconfitte+?,gol_fatti=gol_fatti+?,gol_subiti=gol_subiti+?,partite_giocate=partite_giocate+1 WHERE team_id=? AND anno=?");
+    $upd->execute([$p1,$v1,$pa1,$s1,$gf1,$gs1,$t1['id'],$anno]);
+    $upd->execute([$p2,$v2,$pa2,$s2,$gs1,$gf1,$t2['id'],$anno]);
+
+    return ['gf1'=>$gf1, 'gs1'=>$gs1];
+}
+
+/**
+ * Motore di esito partita basato sulla FORZA (ovr) delle due squadre.
+ * Restituisce gol e punti realistici: le squadre forti vincono più spesso
+ * E segnano di più; le deboli subiscono di più. Il fattore campo (+3 ovr
+ * alla squadra di casa) è applicato quando $homeAdvantage è true.
+ *
+ * @return array [gf1,gs1, p1,p2, v1,v2, pa1,pa2, s1,s2]
+ */
+function _simulaEsitoForza($ovr1, $ovr2, $homeAdvantage = false) {
+    if ($homeAdvantage) $ovr1 += 3; // vantaggio del fattore campo
+    $diff = $ovr1 - $ovr2;
+
+    // Probabilità di vittoria casa: curva più ripida del precedente (×2.2)
+    // così un divario di 15 ovr pesa davvero (≈ +33%).
+    $probWin  = min(85, max(12, 50 + $diff * 2.2));
+    $probDraw = max(8, 26 - abs($diff) * 0.6); // più equilibrio = più pareggi
+    $r = rand(1, 100);
+
+    // Forza relativa → numero di gol attesi (squadre forti segnano di più)
+    $forza1 = max(0.4, min(2.6, ($ovr1 - 45) / 18));
+    $forza2 = max(0.4, min(2.6, ($ovr2 - 45) / 18));
+
+    if ($r <= $probWin) {
+        // Vittoria casa
+        $gf1 = _golPesati($forza1, true);
+        $gs1 = _golPesati($forza2 * 0.6, false);
+        if ($gs1 >= $gf1) $gs1 = max(0, $gf1 - 1);
+        $p1=3;$p2=0; $v1=1;$v2=0;$pa1=0;$pa2=0;$s1=0;$s2=1;
+    } elseif ($r <= $probWin + $probDraw) {
+        // Pareggio
+        $base = _golPesati(($forza1 + $forza2) / 2, false);
+        $gf1 = $base; $gs1 = $base;
+        $p1=1;$p2=1; $v1=0;$v2=0;$pa1=1;$pa2=1;$s1=0;$s2=0;
+    } else {
+        // Vittoria trasferta
+        $gs1 = _golPesati($forza2, true);
+        $gf1 = _golPesati($forza1 * 0.6, false);
+        if ($gf1 >= $gs1) $gf1 = max(0, $gs1 - 1);
+        $p1=0;$p2=3; $v1=0;$v2=1;$pa1=0;$pa2=0;$s1=1;$s2=0;
+    }
+    return [$gf1, $gs1, $p1, $p2, $v1, $v2, $pa1, $pa2, $s1, $s2];
+}
+
+/** Estrae un numero di gol pesato sulla forza (0-5). $vincente alza il minimo. */
+function _golPesati($forza, $vincente) {
+    $atteso = $forza + ($vincente ? 0.8 : 0.0);
+    $g = (int) round($atteso + (rand(-100, 100) / 100) * 1.1);
+    return max($vincente ? 1 : 0, min(5, $g));
+}
+
+// CHAMPIONS CUP — 4 gruppi da 5
+// Calendario (8 partite per squadra = 2/mese × 4 mesi):
+//   Set(9): qualifica e sorteggio gironi + prima giornata
+//   Ott(10): seconda giornata gironi
+//   Nov(11): terza giornata gironi
+//   Dic(12): quarta giornata gironi + chiusura gironi
+//   Gen(1): playoff (2e vs 3e cross-gruppo, andata/ritorno)
+//   Feb(2): ottavi di finale (1e vs vincitori playoff)
+//   Mar(3): quarti di finale
+//   Apr(4): semifinale
+//   Mag(5): finale (gestita da concludiChampions)
+function simulaChampions($db, $p) {
+    $lang    = getLang();
+    $anno    = $p['anno_corrente'];
+    $mese    = $p['mese_corrente'];
+    $team_id = $p['team_id'];
+
+    // Settembre: qualifica + sorteggio + prima giornata
+    if ($mese == 9) {
+        qualificaChampions($db, $anno);
+        $stmt = $db->prepare("SELECT * FROM champions_cup WHERE team_id=? AND anno=?");
+        $stmt->execute([$team_id, $anno]);
+        $record = $stmt->fetch();
+        if (!$record) {
+            _simulaChampionsNPCOnly($db, $anno, $mese, $team_id);
+            return null;
+        }
+        $result = simulaGiornataGruppo($db, $p, $record, $anno, $mese);
+        // Simula anche gli altri gruppi NPC
+        $gruppi = $db->prepare("SELECT DISTINCT gruppo FROM champions_cup WHERE anno=? AND gruppo IS NOT NULL AND gruppo != ?");
+        $gruppi->execute([$anno, $record['gruppo']]);
+        foreach ($gruppi->fetchAll() as $gr) {
+            _simulaGiornataGruppoNPC($db, $anno, $gr['gruppo'], $mese, $team_id);
+        }
+        return $result;
+    }
+
+    $stmt = $db->prepare("SELECT * FROM champions_cup WHERE team_id=? AND anno=?");
+    $stmt->execute([$team_id, $anno]);
+    $record = $stmt->fetch();
+
+    // Giocatore non in Champions o eliminato: simula comunque le NPC
+    if (!$record || $record['eliminato']) {
+        _simulaChampionsNPCOnly($db, $anno, $mese, $team_id);
+        return null;
+    }
+
+    // Gironi: settembre-dicembre
+    if (in_array($mese, [9, 10, 11, 12]) && $record['fase'] == 'gironi') {
+        $result = simulaGiornataGruppo($db, $p, $record, $anno, $mese);
+        // Simula anche gli altri gruppi NPC (escludi il gruppo del giocatore)
+        $gruppi = $db->prepare("SELECT DISTINCT gruppo FROM champions_cup WHERE anno=? AND gruppo IS NOT NULL AND gruppo != ?");
+        $gruppi->execute([$anno, $record['gruppo']]);
+        foreach ($gruppi->fetchAll() as $gr) {
+            _simulaGiornataGruppoNPC($db, $anno, $gr['gruppo'], $mese, $team_id);
+        }
+        return $result;
+    }
+    // Playoff (2e vs 3e): gennaio
+    if ($mese == 1 && $record['fase'] == 'playoff') {
+        return simulaFaseChampions($db, $p, $record, 'playoff', 'ottavi', 52, 'Playoff');
+    }
+    // Playoff (3e vs 2e): gennaio — il giocatore è terzo classificato
+    if ($mese == 1 && $record['fase'] == 'playoff_3') {
+        return simulaFaseChampions($db, $p, $record, 'playoff_3', 'ottavi', 48, 'Playoff');
+    }
+    // Ottavi: febbraio
+    if ($mese == 2 && $record['fase'] == 'ottavi') {
+        return simulaFaseChampions($db, $p, $record, 'ottavi', 'quarti', 55, 'Ottavi di Finale');
+    }
+    // Quarti: marzo
+    if ($mese == 3 && $record['fase'] == 'quarti') {
+        return simulaFaseChampions($db, $p, $record, 'quarti', 'semifinale', 60, 'Quarti di Finale');
+    }
+    // Semifinale: aprile
+    if ($mese == 4 && $record['fase'] == 'semifinale') {
+        return simulaFaseChampions($db, $p, $record, 'semifinale', 'finale', 65, 'Semifinale');
+    }
+    // Finale: maggio
+    if ($mese == 5 && $record['fase'] == 'finale') {
+        return simulaFaseChampions($db, $p, $record, 'finale', 'vincitore', 68, 'Finale');
+    }
+
+    return null;
+}
+
+// Simula Champions per NPC quando il giocatore non partecipa
+function _simulaChampionsNPCOnly($db, $anno, $mese, $skip_team_id) {
+    // Settembre: assicura che i gironi vengano creati anche senza il giocatore
+    if ($mese == 9) qualificaChampions($db, $anno);
+
+    if (in_array($mese, [9, 10, 11, 12])) {
+        $gruppi = $db->prepare("SELECT DISTINCT gruppo FROM champions_cup WHERE anno=? AND gruppo IS NOT NULL");
+        $gruppi->execute([$anno]);
+        foreach ($gruppi->fetchAll() as $gr) {
+            _simulaGiornataGruppoNPC($db, $anno, $gr['gruppo'], $mese, $skip_team_id);
+        }
+    } elseif ($mese == 1) {
+        _simulaPlayoffNPC($db, $anno, $skip_team_id);
+    } elseif ($mese == 2) {
+        // Risolvi playoff ancora aperti prima degli ottavi
+        _simulaPlayoffNPC($db, $anno, $skip_team_id);
+        _simulaFaseNPC($db, $anno, 'ottavi', 'quarti', $skip_team_id);
+    } elseif ($mese == 3) {
+        _simulaFaseNPC($db, $anno, 'quarti', 'semifinale', $skip_team_id);
+    } elseif ($mese == 4) {
+        _simulaFaseNPC($db, $anno, 'semifinale', 'finale', $skip_team_id);
+    } elseif ($mese == 5) {
+        _simulaFaseNPC($db, $anno, 'finale', 'vincitore', $skip_team_id);
+    }
+}
+
+function _simulaGiornataGruppoNPC($db, $anno, $gruppo, $mese, $skip_team_id) {
+    // 5 squadre NPC (S0..S4). S0 fa da perno (2 partite/mese).
+    // S1..S4: 2 vs S0 + 6 NPC-NPC = 8 totali ✓. S0: 2/mese × 4 = 8 ✓
+    // Stesso schema del gruppo col giocatore (P=S0, N0..N3=S1..S4):
+    // Perno(S0) gioca: Set(S1,S2) Ott(S3,S4) Nov(S1,S2) Dic(S3,S4)
+    // NPC-NPC (3/mese, round-robin A+R tra S1..S4 in 4 mesi):
+    // Set: S3-S4, S3-S1, S2-S4  Ott: S1-S2, S1-S4, S2-S3
+    // Nov: S4-S3, S1-S3, S4-S2  Dic: S2-S1, S4-S1, S3-S2
+
+    $stmt = $db->prepare("SELECT cc.team_id, t.ovr FROM champions_cup cc JOIN teams t ON cc.team_id=t.id WHERE cc.anno=? AND cc.gruppo=? ORDER BY cc.team_id");
+    $stmt->execute([$anno, $gruppo]);
+    $sq = $stmt->fetchAll();
+    if (count($sq) < 5) return;
+
+    // indici assoluti in $sq: S0=0, S1=1, S2=2, S3=3, S4=4
+    $full_schedule = [
+        9  => [[0,1],[0,2],  [3,4],[3,1],[2,4]],
+        10 => [[0,3],[0,4],  [1,2],[1,4],[2,3]],
+        11 => [[0,1],[0,2],  [4,3],[1,3],[4,2]],
+        12 => [[0,3],[0,4],  [2,1],[4,1],[3,2]],
+    ];
+
+    foreach ($full_schedule[$mese] ?? [[0,1],[2,3],[1,4]] as [$ia, $ib]) {
+        if (!isset($sq[$ia]) || !isset($sq[$ib])) continue;
+        [$gf, $gs, $p1] = _simulaMatchGruppo(intval($sq[$ia]['ovr']), intval($sq[$ib]['ovr']));
+        $p2 = ($p1===3?0:($p1===1?1:3));
+        $v1=$p1===3?1:0; $pa1=$p1===1?1:0; $s1=$p1===0?1:0;
+        $v2=$p2===3?1:0; $pa2=$p2===1?1:0; $s2=$p2===0?1:0;
+        $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+1 WHERE team_id=? AND anno=?")
+           ->execute([$p1,$v1,$pa1,$s1,$gf,$gs,$sq[$ia]['team_id'],$anno]);
+        $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+1 WHERE team_id=? AND anno=?")
+           ->execute([$p2,$v2,$pa2,$s2,$gs,$gf,$sq[$ib]['team_id'],$anno]);
+    }
+    if ($mese == 12) {
+        _chiudiGironeSoloNPC($db, $anno, $gruppo, $skip_team_id);
+    }
+}
+
+function _chiudiGironeSoloNPC($db, $anno, $gruppo, $skip_team_id) {
+    $stmt = $db->prepare("SELECT cc.team_id FROM champions_cup cc WHERE cc.anno=? AND cc.gruppo=? AND cc.team_id!=? ORDER BY cc.punti_gruppo DESC, (cc.gol_fatti_gruppo-cc.gol_subiti_gruppo) DESC, cc.gol_fatti_gruppo DESC, cc.vittorie_gruppo DESC");
+    $stmt->execute([$anno, $gruppo, $skip_team_id]);
+    $classifica = $stmt->fetchAll();
+    foreach ($classifica as $i => $r) {
+        $pos = $i + 1;
+        $db->prepare("UPDATE champions_cup SET posizione_gruppo=? WHERE team_id=? AND anno=?")->execute([$pos, $r['team_id'], $anno]);
+        if ($i === 0) {
+            $db->prepare("UPDATE champions_cup SET fase='ottavi' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } elseif ($i === 1) {
+            $db->prepare("UPDATE champions_cup SET fase='playoff' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } elseif ($i === 2) {
+            $db->prepare("UPDATE champions_cup SET fase='playoff_3' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } else {
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        }
+    }
+}
+
+function qualificaChampions($db, $anno) {
+    $stmt = $db->prepare("SELECT COUNT(*) as n FROM champions_cup WHERE anno=?");
+    $stmt->execute([$anno]);
+    if ($stmt->fetch()['n'] > 0) return;
+
+    $tutte = [];
+    $leghe = $db->query("SELECT id FROM leghe WHERE livello=1")->fetchAll();
+    foreach ($leghe as $lega) {
+        // Usa l'anno precedente: la qualifica si basa sui risultati del campionato appena concluso
+        $anno_class = $anno - 1;
+        $stmt = $db->prepare("SELECT c.team_id, t.ovr FROM classifica c JOIN teams t ON c.team_id=t.id WHERE c.lega_id=? AND c.anno=? ORDER BY c.punti DESC, (c.gol_fatti-c.gol_subiti) DESC, c.gol_fatti DESC, c.vittorie DESC LIMIT 4");
+        $stmt->execute([$lega['id'], $anno_class]);
+        $top4 = $stmt->fetchAll();
+        if (empty($top4)) {
+            $stmt2 = $db->prepare("SELECT id as team_id, ovr FROM teams WHERE lega_id=? ORDER BY stelle DESC, ovr DESC LIMIT 4");
+            $stmt2->execute([$lega['id']]);
+            $top4 = $stmt2->fetchAll();
+        }
+        foreach ($top4 as $t) $tutte[] = $t;
+    }
+    if (empty($tutte)) return;
+
+    usort($tutte, fn($a,$b) => intval($b['ovr']) - intval($a['ovr']));
+    $gruppi = ['A', 'B', 'C', 'D'];
+    $tutte = array_slice($tutte, 0, 20);
+    foreach ($tutte as $i => $t) {
+        $db->prepare("INSERT IGNORE INTO champions_cup (anno,team_id,fase,gruppo) VALUES(?,?,'gironi',?)")
+           ->execute([$anno, $t['team_id'], $gruppi[$i % 4]]);
+    }
+}
+
+function simulaGiornataGruppo($db, $p, $record, $anno, $mese) {
+    $team_id  = $p['team_id'];
+    $gruppo   = $record['gruppo'];
+    $team_ovr = intval($p['team_ovr'] ?? 65);
+
+    $stmt = $db->prepare("SELECT cc.team_id, t.ovr FROM champions_cup cc JOIN teams t ON cc.team_id=t.id WHERE cc.anno=? AND cc.gruppo=? ORDER BY cc.team_id");
+    $stmt->execute([$anno, $gruppo]);
+    $tutte_squadre = $stmt->fetchAll();
+    if (count($tutte_squadre) < 2) return null;
+
+    $avversari = array_values(array_filter($tutte_squadre, fn($t) => $t['team_id'] != $team_id));
+    $n_avv = count($avversari); // 4 NPC: N0..N3
+
+    // Calendario bilanciato: ogni squadra 8 partite totali (4 avversari x A+R).
+    // 5 match/mese: P gioca 2 vs NPC + 3 match NPC-NPC.
+    // P affronta ogni NPC esattamente 2 volte. Ogni NPC fa 2 vsP + 6 NPC-NPC = 8. OK
+    //
+    // P vs NPC:  Set(N0,N1)  Ott(N2,N3)  Nov(N0,N1 ritorno)  Dic(N2,N3 ritorno)
+    //
+    // NPC-NPC (round-robin A+R tra N0..N3, 3 match/mese x 4 mesi = 12 = 6coppie x2):
+    // Set(9):  N2-N3, N2-N0, N1-N3
+    // Ott(10): N0-N1, N0-N3, N1-N2
+    // Nov(11): N3-N2, N0-N2, N3-N1  (ritorni Set)
+    // Dic(12): N1-N0, N3-N0, N2-N1  (ritorni Ott)
+    $player_schedule = [
+        9  => [0, 1],
+        10 => [2, 3],
+        11 => [0, 1],
+        12 => [2, 3],
+    ];
+    $npc_schedule = [
+        9  => [[2,3],[2,0],[1,3]],
+        10 => [[0,1],[0,3],[1,2]],
+        11 => [[3,2],[0,2],[3,1]],
+        12 => [[1,0],[3,0],[2,1]],
+    ];
+
+    $avv_idx_list = $player_schedule[$mese] ?? [0, 1];
+    $gol_fatti = 0; $gol_subiti = 0; $punti = 0; $partite_giocate = 0;
+    $vittorie = 0; $pareggi = 0; $sconfitte = 0;
+    $msgs = [];
+
+    // --- 2 Partite del giocatore ---
+    foreach ($avv_idx_list as $idx) {
+        if (!isset($avversari[$idx % $n_avv])) continue;
+        $avv = $avversari[$idx % $n_avv];
+        [$gf, $gs, $pt] = _simulaMatchGruppo($team_ovr, intval($avv['ovr']));
+        $gol_fatti += $gf; $gol_subiti += $gs; $punti += $pt; $partite_giocate++;
+        if ($pt === 3) $vittorie++; elseif ($pt === 1) $pareggi++; else $sconfitte++;
+        $pt_avv = ($pt === 3 ? 0 : ($pt === 1 ? 1 : 3));
+        $v_avv=$pt_avv===3?1:0; $pa_avv=$pt_avv===1?1:0; $s_avv=$pt_avv===0?1:0;
+        $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+1 WHERE team_id=? AND anno=?")
+           ->execute([$pt_avv,$v_avv,$pa_avv,$s_avv,$gs,$gf,$avv['team_id'],$anno]);
+        $msgs[] = "{$gf}-{$gs}";
+    }
+
+    // Aggiorna giocatore in blocco
+    $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+? WHERE team_id=? AND anno=?")
+       ->execute([$punti,$vittorie,$pareggi,$sconfitte,$gol_fatti,$gol_subiti,$partite_giocate,$team_id,$anno]);
+
+    // --- 3 Partite NPC vs NPC ---
+    foreach ($npc_schedule[$mese] ?? [] as [$ia, $ib]) {
+        if (!isset($avversari[$ia % $n_avv]) || !isset($avversari[$ib % $n_avv])) continue;
+        [$gf1,$gs1,$p1] = _simulaMatchGruppo(intval($avversari[$ia % $n_avv]['ovr']), intval($avversari[$ib % $n_avv]['ovr']));
+        $p2=($p1===3?0:($p1===1?1:3));
+        $v1=$p1===3?1:0;$pa1=$p1===1?1:0;$s1=$p1===0?1:0;
+        $v2=$p2===3?1:0;$pa2=$p2===1?1:0;$s2=$p2===0?1:0;
+        $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+1 WHERE team_id=? AND anno=?")
+           ->execute([$p1,$v1,$pa1,$s1,$gf1,$gs1,$avversari[$ia % $n_avv]['team_id'],$anno]);
+        $db->prepare("UPDATE champions_cup SET punti_gruppo=punti_gruppo+?,vittorie_gruppo=vittorie_gruppo+?,pareggi_gruppo=pareggi_gruppo+?,sconfitte_gruppo=sconfitte_gruppo+?,gol_fatti_gruppo=gol_fatti_gruppo+?,gol_subiti_gruppo=gol_subiti_gruppo+?,partite_gruppo=partite_gruppo+1 WHERE team_id=? AND anno=?")
+           ->execute([$p2,$v2,$pa2,$s2,$gs1,$gf1,$avversari[$ib % $n_avv]['team_id'],$anno]);
+    }
+
+    if ($mese == 12) {
+        return chiudiGirone($db, $p, $record, $anno, $gruppo);
+    }
+
+    $esito = $punti >= 6 ? "🏆" : ($punti >= 2 ? "🤝" : "💔");
+    return "{$esito} Champions Gr.{$gruppo}: " . implode(', ', $msgs) . " ({$punti}pt)";
+}
+
+// Simula una partita di gruppo: restituisce [gol_fatti, gol_subiti, punti_squadra1]
+function _simulaMatchGruppo($ovr1, $ovr2) {
+    // Usa il motore di forza condiviso (senza fattore campo: gironi neutri).
+    $res = _simulaEsitoForza($ovr1, $ovr2, false);
+    // res = [gf1,gs1,p1,p2,...]; restituiamo nel formato atteso [gf,gs,pt]
+    return [$res[0], $res[1], $res[2]];
+}
+
+function chiudiGirone($db, $p, $record, $anno, $gruppo) {
+    $team_id = $p['team_id'];
+    $stmt = $db->prepare("SELECT cc.team_id, cc.punti_gruppo, cc.gol_fatti_gruppo, cc.gol_subiti_gruppo FROM champions_cup cc WHERE cc.anno=? AND cc.gruppo=? ORDER BY cc.punti_gruppo DESC, (cc.gol_fatti_gruppo-cc.gol_subiti_gruppo) DESC, cc.gol_fatti_gruppo DESC, cc.vittorie_gruppo DESC");
+    $stmt->execute([$anno, $gruppo]);
+    $classifica_gruppo = $stmt->fetchAll();
+
+    foreach ($classifica_gruppo as $i => $r) {
+        $pos = $i + 1;
+        $db->prepare("UPDATE champions_cup SET posizione_gruppo=? WHERE team_id=? AND anno=?")->execute([$pos, $r['team_id'], $anno]);
+        if ($i === 0) {
+            $db->prepare("UPDATE champions_cup SET fase='ottavi' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } elseif ($i === 1) {
+            $db->prepare("UPDATE champions_cup SET fase='playoff' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } elseif ($i === 2) {
+            // Terza classificata → playoff_3 (attende la 2a di un altro gruppo)
+            $db->prepare("UPDATE champions_cup SET fase='playoff_3' WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        } else {
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$r['team_id'],$anno]);
+        }
+    }
+
+    $pos = 0;
+    foreach ($classifica_gruppo as $i => $r) {
+        if ($r['team_id'] == $team_id) { $pos = $i + 1; break; }
+    }
+
+    if ($pos === 1)     return "🏆 Champions - 1° Gr.{$gruppo}! Agli Ottavi di Finale!";
+    elseif ($pos === 2) return "🤝 Champions - 2° Gr.{$gruppo}. Playoff per gli Ottavi!";
+    elseif ($pos === 3) return "⚡ Champions - 3° Gr.{$gruppo}. Playoff per gli Ottavi!";
+    else                return "💔 Champions - Eliminato gironi (Gr.{$gruppo}, {$pos}° posto).";
+}
+
+function simulaFaseChampions($db, $p, $record, $fase_corrente, $fase_successiva, $prob_base, $label_fase) {
+    $team_ovr = intval($p['team_ovr'] ?? 65);
+    $anno     = $p['anno_corrente'];
+    $team_id  = $p['team_id'];
+    $gruppo   = $record['gruppo'];
+    $pos      = intval($record['posizione_gruppo']);
+
+    // Playoff: il giocatore affronta il suo avversario cross-gruppo specifico
+    if ($fase_corrente === 'playoff' || $fase_corrente === 'playoff_3') {
+        // Mappa accoppiamenti: A2→C3, B2→D3, C2→A3, D2→B3 (e viceversa)
+        $pairings = ['A'=>['opp_gruppo'=>'C','opp_pos'=>3,'own_pos'=>2],
+                     'B'=>['opp_gruppo'=>'D','opp_pos'=>3,'own_pos'=>2],
+                     'C'=>['opp_gruppo'=>'A','opp_pos'=>3,'own_pos'=>2],
+                     'D'=>['opp_gruppo'=>'B','opp_pos'=>3,'own_pos'=>2]];
+        // Se il giocatore è terzo, il suo avversario è la seconda del suo gruppo speculare
+        if ($pos === 3) {
+            // A3→C2, B3→D2, C3→A2, D3→B2 (coerente con _simulaPlayoffNPC)
+            $info = $pairings[$gruppo] ?? null;
+            if ($info) $info['opp_pos'] = 2; // terzo sfida una seconda
+        } else {
+            $info = $pairings[$gruppo] ?? null;
+        }
+        // Trova OVR avversario per calibrare la probabilità
+        $avv_ovr = 70; // default
+        if ($info) {
+            $stmt = $db->prepare("SELECT t.ovr FROM champions_cup cc JOIN teams t ON cc.team_id=t.id WHERE cc.anno=? AND cc.gruppo=? AND cc.posizione_gruppo=? LIMIT 1");
+            $stmt->execute([$anno, $info['opp_gruppo'], $info['opp_pos']]);
+            $avv = $stmt->fetch();
+            if ($avv) $avv_ovr = intval($avv['ovr']);
+        }
+        $prob = min(80, max(20, 50 + ($team_ovr - $avv_ovr) * 0.8));
+        _simulaPlayoffNPC($db, $anno, $team_id);
+    } else {
+        // Se il giocatore è agli ottavi, processa anche i playoff NPC rimasti
+        if ($fase_corrente === 'ottavi') {
+            _simulaPlayoffNPC($db, $anno, $team_id);
+        }
+        $prob = min(75, max(30, $prob_base + ($team_ovr - 70) * 0.5));
+        _simulaFaseNPC($db, $anno, $fase_corrente, $fase_successiva, $team_id);
+    }
+
+    $avanza = rand(1, 100) <= $prob;
+    if ($avanza) {
+        $db->prepare("UPDATE champions_cup SET fase=? WHERE team_id=? AND anno=?")
+           ->execute([$fase_successiva, $team_id, $anno]);
+        $labels = ['playoff'=>'Playoff','ottavi'=>'Ottavi','quarti'=>'Quarti','semifinale'=>'Semifinale','finale'=>'Finale','vincitore'=>'Champions Cup 🏆'];
+        if ($fase_successiva === 'vincitore') {
+            return "🏆🌟 Champions Cup — {$label_fase}: HAI VINTO LA CHAMPIONS CUP! Il premio sarà assegnato a fine stagione.";
+        }
+        return "🏆 Champions Cup — {$label_fase}: avanza agli/ai " . ($labels[$fase_successiva] ?? $fase_successiva) . "!";
+    } else {
+        $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")
+           ->execute([$team_id, $anno]);
+        return "💔 Champions Cup — Eliminato in {$label_fase}.";
+    }
+}
+
+// Simula playoff: accoppiamenti fissi cross-gruppo
+// A2 vs C3, B2 vs D3, C2 vs A3, D2 vs B3
+function _simulaPlayoffNPC($db, $anno, $skip_team_id) {
+    // Carica tutte le seconde e terze (escludi il giocatore)
+    $stmt = $db->prepare("SELECT cc.team_id, cc.gruppo, cc.posizione_gruppo, t.ovr FROM champions_cup cc JOIN teams t ON cc.team_id=t.id WHERE cc.anno=? AND cc.fase IN ('playoff','playoff_3') AND cc.eliminato=0 AND cc.team_id!=?");
+    $stmt->execute([$anno, $skip_team_id]);
+    $teams = $stmt->fetchAll();
+
+    // Indicizza per gruppo e posizione
+    $by_gruppo_pos = [];
+    foreach ($teams as $t) {
+        $by_gruppo_pos[$t['gruppo']][$t['posizione_gruppo']] = $t;
+    }
+
+    // Accoppiamenti fissi: A2 vs C3, B2 vs D3, C2 vs A3, D2 vs B3
+    $matches = [
+        ['A', 2, 'C', 3],
+        ['B', 2, 'D', 3],
+        ['C', 2, 'A', 3],
+        ['D', 2, 'B', 3],
+    ];
+
+    $processati = [];
+    foreach ($matches as [$g2, $p2, $g3, $p3]) {
+        $sq2 = $by_gruppo_pos[$g2][$p2] ?? null;
+        $sq3 = $by_gruppo_pos[$g3][$p3] ?? null;
+        if (!$sq2 || !$sq3) continue;
+        if (in_array($sq2['team_id'], $processati) || in_array($sq3['team_id'], $processati)) continue;
+
+        $prob = min(88, max(12, 50 + (intval($sq2['ovr']) - intval($sq3['ovr'])) * 1.4));
+        if (rand(1, 100) <= $prob) {
+            $db->prepare("UPDATE champions_cup SET fase='ottavi' WHERE team_id=? AND anno=?")->execute([$sq2['team_id'], $anno]);
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$sq3['team_id'], $anno]);
+        } else {
+            $db->prepare("UPDATE champions_cup SET fase='ottavi' WHERE team_id=? AND anno=?")->execute([$sq3['team_id'], $anno]);
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$sq2['team_id'], $anno]);
+        }
+        $processati[] = $sq2['team_id'];
+        $processati[] = $sq3['team_id'];
+    }
+    // Elimina eventuali playoff rimasti senza match
+    $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE anno=? AND fase IN ('playoff','playoff_3') AND eliminato=0 AND team_id!=?")->execute([$anno, $skip_team_id]);
+}
+
+function _simulaFaseNPC($db, $anno, $fase_corrente, $fase_successiva, $skip_team_id) {
+    $stmt = $db->prepare("SELECT cc.team_id, t.ovr FROM champions_cup cc JOIN teams t ON cc.team_id=t.id WHERE cc.anno=? AND cc.fase=? AND cc.eliminato=0 AND cc.team_id!=? ORDER BY t.ovr DESC");
+    $stmt->execute([$anno, $fase_corrente, $skip_team_id]);
+    $npc = $stmt->fetchAll();
+    // Accoppia in coppie ordinate per OVR: 1° vs 2°, 3° vs 4°, ecc.
+    // Garantisce che esattamente metà delle squadre avanzi
+    for ($i = 0; $i + 1 < count($npc); $i += 2) {
+        $sq1 = $npc[$i]; $sq2 = $npc[$i + 1];
+        $prob = min(88, max(12, 50 + (intval($sq1['ovr']) - intval($sq2['ovr'])) * 1.4));
+        if (rand(1, 100) <= $prob) {
+            $db->prepare("UPDATE champions_cup SET fase=? WHERE team_id=? AND anno=?")->execute([$fase_successiva, $sq1['team_id'], $anno]);
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$sq2['team_id'], $anno]);
+        } else {
+            $db->prepare("UPDATE champions_cup SET fase=? WHERE team_id=? AND anno=?")->execute([$fase_successiva, $sq2['team_id'], $anno]);
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$sq1['team_id'], $anno]);
+        }
+    }
+    // Squadra dispari rimasta (caso anomalo): eliminata
+    if (count($npc) % 2 === 1) {
+        $last = $npc[count($npc) - 1];
+        $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$last['team_id'], $anno]);
+    }
+}
+
+function concludiChampions($db, $p, $player_id) {
+    $anno = $p['anno_corrente']; $team_id = $p['team_id'];
+    $msgs = []; $soldi = 0; $trofei = 0; $champions_win = false;
+
+    // A giugno risolvi eventuali NPC rimasti in finale (non processati a maggio)
+    _simulaFaseNPC($db, $anno, 'finale', 'vincitore', $team_id);
+
+    $stmt = $db->prepare("SELECT * FROM champions_cup WHERE team_id=? AND anno=?");
+    $stmt->execute([$team_id, $anno]);
+    $record = $stmt->fetch();
+    if (!$record || $record['eliminato']) return ['messaggi'=>$msgs,'soldi'=>$soldi,'trofei'=>$trofei,'champions_win'=>false];
+
+    // Fallback: se il giocatore è ancora in 'semifinale' o 'finale' (non processato a maggio)
+    // Nel gioco la 'semifinale' PHP è la vera finale (solo 2 squadre rimaste dopo i quarti)
+    if ($record['fase'] == 'semifinale') {
+        $prob = min(70, max(30, 50 + (intval($p['team_ovr'] ?? 65) - 70) * 0.5));
+        if (rand(1,100) <= $prob) {
+            $db->prepare("UPDATE champions_cup SET fase='vincitore' WHERE team_id=? AND anno=?")->execute([$team_id,$anno]);
+            $msgs[] = _tn("🏆🌟 LA TUA SQUADRA HA VINTO LA CHAMPIONS CUP!!! +€500,000!","🏆🌟 YOUR TEAM WON THE CHAMPIONS CUP!!! +€500,000!","🏆🌟 DEIN TEAM HAT DEN CHAMPIONS CUP GEWONNEN!!! +€500.000!","🏆🌟 ¡TU EQUIPO HA GANADO LA COPA DE CAMPEONES!!! +€500.000!");
+            $soldi += 500000; $trofei += 1; $champions_win = true;
+        } else {
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$team_id,$anno]);
+            $msgs[] = _tn("💔 Sconfitta in finale di Champions Cup.","💔 Defeat in the Champions Cup final.","💔 Niederlage im Champions-Cup-Finale.","💔 Derrota en la final de la Copa de Campeones.");
+            $msgs[] = _tn("💰 Bonus finalista Champions: +€100,000","💰 Champions finalist bonus: +€100,000","💰 Champions-Finalist-Bonus: +€100.000","💰 Bono finalista Champions: +€100.000");
+            $soldi += 100000;
+        }
+        return ['messaggi'=>$msgs,'soldi'=>$soldi,'trofei'=>$trofei,'champions_win'=>$champions_win];
+    }
+    if ($record['fase'] == 'finale') {
+        $prob = min(70, max(30, 50 + (intval($p['team_ovr'] ?? 65) - 70) * 0.5));
+        if (rand(1,100) <= $prob) {
+            $db->prepare("UPDATE champions_cup SET fase='vincitore' WHERE team_id=? AND anno=?")->execute([$team_id,$anno]);
+            $msgs[] = _tn("🏆🌟 LA TUA SQUADRA HA VINTO LA CHAMPIONS CUP!!! +€500,000!","🏆🌟 YOUR TEAM WON THE CHAMPIONS CUP!!! +€500,000!","🏆🌟 DEIN TEAM HAT DEN CHAMPIONS CUP GEWONNEN!!! +€500.000!","🏆🌟 ¡TU EQUIPO HA GANADO LA COPA DE CAMPEONES!!! +€500.000!");
+            $soldi += 500000; $trofei += 1; $champions_win = true;
+        } else {
+            $db->prepare("UPDATE champions_cup SET eliminato=1 WHERE team_id=? AND anno=?")->execute([$team_id,$anno]);
+            $msgs[] = _tn("💔 Sconfitta in finale di Champions Cup.","💔 Defeat in the Champions Cup final.","💔 Niederlage im Champions-Cup-Finale.","💔 Derrota en la final de la Copa de Campeones.");
+            $msgs[] = _tn("💰 Bonus finalista Champions: +€100,000","💰 Champions finalist bonus: +€100,000","💰 Champions-Finalist-Bonus: +€100.000","💰 Bono finalista Champions: +€100.000");
+            $soldi += 100000;
+        }
+    } elseif ($record['fase'] == 'vincitore') {
+        // Già vinto a maggio (caso normale): assegna premio qui a giugno UNA SOLA VOLTA
+        // Controlla se il premio è già stato pagato (evita double-award)
+        $premio_stmt = $db->prepare("SELECT champions_premio_pagato FROM players WHERE id=?");
+        $premio_stmt->execute([$player_id]);
+        $gia_pagato = intval(($premio_stmt->fetch()['champions_premio_pagato'] ?? 0));
+        if (!$gia_pagato) {
+            $msgs[] = _tn("🏆🌟 LA TUA SQUADRA HA VINTO LA CHAMPIONS CUP!!! +€500,000!","🏆🌟 YOUR TEAM WON THE CHAMPIONS CUP!!! +€500,000!","🏆🌟 DEIN TEAM HAT DEN CHAMPIONS CUP GEWONNEN!!! +€500.000!","🏆🌟 ¡TU EQUIPO HA GANADO LA COPA DE CAMPEONES!!! +€500.000!");
+            $soldi += 500000; $trofei += 1; $champions_win = true;
+            $db->prepare("UPDATE players SET champions_premio_pagato=1 WHERE id=?")->execute([$player_id]);
+        }
+    }
+    return ['messaggi'=>$msgs,'soldi'=>$soldi,'trofei'=>$trofei,'champions_win'=>$champions_win];
+}
+
+// ── PREMI CAMPIONATO A FINE ANNO ──
+function calcPremiCampionato($db, $p, $player_id) {
+    $lega_id = $p['lega_id'];
+    $anno    = $p['anno_corrente'];
+    $team_id = $p['team_id'];
+    $msg_list = []; $soldi = 0; $trofei = 0;
+
+    // Posizione finale
+    $stmt = $db->prepare("
+        SELECT c.team_id, c.punti, (c.gol_fatti-c.gol_subiti) as diff
+        FROM classifica c
+        WHERE c.lega_id=? AND c.anno=?
+        ORDER BY c.punti DESC, diff DESC, c.gol_fatti DESC, c.vittorie DESC
+    ");
+    $stmt->execute([$lega_id,$anno]);
+    $classifica = $stmt->fetchAll();
+
+    $pos = 0;
+    foreach ($classifica as $i => $row) {
+        if ($row['team_id'] == $team_id) { $pos = $i + 1; break; }
+    }
+    if (!$pos) return ['messaggi'=>$msg_list,'soldi'=>$soldi,'trofei'=>$trofei];
+
+    $lega_livello = intval($p['lega_livello'] ?? 2);
+
+    if ($pos == 1) {
+        $premio = ($lega_livello == 1) ? 300000 : 100000;
+        $msg_list[] = _tn("🏆 CAMPIONI! La tua squadra ha vinto il campionato! +€".number_format($premio),"🏆 CHAMPIONS! Your team won the league! +€".number_format($premio),"🏆 MEISTER! Dein Team hat die Liga gewonnen! +€".number_format($premio),"🏆 ¡CAMPEONES! ¡Tu equipo ganó la liga! +€".number_format($premio));
+        $soldi  += $premio; $trofei += 1;
+    } elseif ($pos <= 3) {
+        $premio = ($lega_livello == 1) ? 100000 : 30000;
+        $msg_list[] = _tn("🥉 Podio in campionato (#{$pos})! +€".number_format($premio),"🥉 Podium finish (#{$pos})! +€".number_format($premio),"🥉 Podiumsplatz (#{$pos})! +€".number_format($premio),"🥉 ¡Podio en la liga (#{$pos})! +€".number_format($premio));
+        $soldi += $premio;
+    } elseif ($pos <= 4 && $lega_livello == 1) {
+        $msg_list[] = _tn("⭐ Top 4 in Prima Divisione: qualificato alla Champions Cup!","⭐ Top 4 in First Division: qualified for the Champions Cup!","⭐ Top 4 in der Ersten Division: für den Champions Cup qualifiziert!","⭐ ¡Top 4 en Primera División: clasificado para la Copa de Campeones!");
+    } elseif ($pos >= count($classifica) - 2 && count($classifica) >= 10) {
+        $msg_list[] = _tn("⚠️ La tua squadra ha chiuso nelle ultime posizioni. Rischio retrocessione!", "⚠️ Your team finished in the bottom places. Relegation risk!", "⚠️ Deine Mannschaft schloss in den letzten Positionen. Abstiegsgefahr!", "⚠️ Tu equipo terminó en los últimos puestos. ¡Riesgo de descenso!");
+    }
+
+    return ['messaggi'=>$msg_list,'soldi'=>$soldi,'trofei'=>$trofei];
+}
+
+// ── PROMOZIONE / RETROCESSIONE ──
+function checkPromozioneRetrocessione($db, $player_id, $p, $overall) {
+    $lega_id      = intval($p['lega_id'] ?? 0);
+    $lega_livello = intval($p['lega_livello'] ?? 1);
+    $nazione_id   = intval($p['nazione_id'] ?? 1);
+    if (!$lega_id) return null;
+
+    $stmt = $db->prepare("SELECT SUM(gol) as gol, AVG(voto) as voto FROM log_mensile WHERE player_id=? AND anno=? AND avv!='' AND avv!='__riepilogo'");
+    $stmt->execute([$player_id,$p['anno_corrente']]);
+    $stats = $stmt->fetch();
+    $voto = floatval($stats['voto'] ?? 6.0);
+    $gol  = intval($stats['gol'] ?? 0);
+    $perf_score = $voto*10 + $gol*2 + $overall*0.3;
+
+    if ($lega_livello == 2 && $perf_score >= 100) {
+        $stmt = $db->prepare("SELECT id FROM leghe WHERE nazione_id=? AND livello=1");
+        $stmt->execute([$nazione_id]);
+        $prima = $stmt->fetch();
+        if ($prima) {
+            $stmt = $db->prepare("SELECT id,nome FROM teams WHERE lega_id=? ORDER BY stelle ASC,popolarita ASC LIMIT 1");
+            $stmt->execute([$prima['id']]);
+            $sq = $stmt->fetch();
+            if ($sq) return ['tipo'=>'promozione','msg'=>_tn("🚀 PROMOZIONE! Sei salito in Prima Divisione: ","🚀 PROMOTION! You've risen to the First Division: ","🚀 AUFSTIEG! Du bist in die Erste Division aufgestiegen: ","🚀 ¡ASCENSO! Has subido a la Primera División: ").$sq['nome'],'new_team_id'=>$sq['id']];
+        }
+    }
+    if ($lega_livello == 1 && $perf_score < 60 && $overall < 85) {
+        $stmt = $db->prepare("SELECT id FROM leghe WHERE nazione_id=? AND livello=2");
+        $stmt->execute([$nazione_id]);
+        $seconda = $stmt->fetch();
+        if ($seconda) {
+            $stmt = $db->prepare("SELECT id,nome FROM teams WHERE lega_id=? ORDER BY stelle DESC,popolarita DESC LIMIT 1");
+            $stmt->execute([$seconda['id']]);
+            $sq = $stmt->fetch();
+            if ($sq) return ['tipo'=>'retrocessione','msg'=>_tn("📉 RETROCESSIONE in Seconda Divisione: ","📉 RELEGATION to Second Division: ","📉 ABSTIEG in die Zweite Division: ","📉 DESCENSO a la Segunda División: ").$sq['nome'],'new_team_id'=>$sq['id']];
+        }
+    }
+    return null;
+}
+
+// ── AGENTE & NOTIZIE ──
+function getAgentBonus($db, $player_id) {
+    $stmt = $db->prepare("SELECT livello FROM agente WHERE player_id=?");
+    $stmt->execute([$player_id]);
+    $ag = $stmt->fetch();
+    if (!$ag || !$ag['livello']) return ['bonus_stipendio'=>0,'bonus_offerte'=>0,'bonus_ovr_sconto'=>0];
+    $agenti = [
+        1=>['bonus_stipendio'=>0.10,'bonus_offerte'=>1,'bonus_ovr_sconto'=>2.5],
+        2=>['bonus_stipendio'=>0.20,'bonus_offerte'=>2,'bonus_ovr_sconto'=>5.0],
+        3=>['bonus_stipendio'=>0.35,'bonus_offerte'=>3,'bonus_ovr_sconto'=>7.5],
+        4=>['bonus_stipendio'=>0.50,'bonus_offerte'=>5,'bonus_ovr_sconto'=>10.0],
+        5=>['bonus_stipendio'=>0.75,'bonus_offerte'=>7,'bonus_ovr_sconto'=>15.0],
+    ];
+    return $agenti[$ag['livello']] ?? ['bonus_stipendio'=>0,'bonus_offerte'=>0,'bonus_ovr_sconto'=>0];
+}
+
+function generaNotizia($db, $player_id, $anno, $mese, $titolo, $testo, $tipo='info', $titolo_en=null, $testo_en=null, $titolo_de=null, $testo_de=null, $titolo_es=null, $testo_es=null) {
+    $db->prepare("INSERT INTO notizie (player_id,anno,mese,titolo,testo,titolo_en,testo_en,titolo_de,testo_de,titolo_es,testo_es,tipo) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+       ->execute([$player_id, $anno, $mese, $titolo, $testo, $titolo_en, $testo_en, $titolo_de, $testo_de, $titolo_es, $testo_es, $tipo]);
+}
+
+
+// ── Bilingual news helper: picks IT or EN string from parallel arrays ──────
+// $_gsLangOverride allows temporary lang forcing without touching getLang()
+$GLOBALS['_gsLangOverride'] = null;
+function _gsLang(): string {
+    return $GLOBALS['_gsLangOverride'] ?? getLang();
+}
+
+// ── DE/ES translation lookup for game strings ──────────────────────────────
+function _getGameStringTranslation(string $it, string $lang): string {
+    static $maps = null;
+    if ($maps === null) {
+        $maps = [
+            'de' => [
+        '💥 Potenza devastante' => '💥 Verheerende Kraft',
+        '🌀 Magia con l\'esterno' => '🌀 Magie mit dem Außenrist',
+        '🎭 RABONA IN PARTITA!' => '🎭 RABONA IM SPIEL!',
+        '👑 Re dell\'aria' => '👑 König der Lüfte',
+        '⚡ Velocità della luce' => '⚡ Lichtgeschwindigkeit',
+        '🧊 Sangue freddo assoluto' => '🧊 Eiskalte Kaltblütigkeit',
+        '🎯 Istinto puro' => '🎯 Reiner Instinkt',
+        '🧩 Lettura tattica perfetta' => '🧩 Perfekte taktische Spiellektüre',
+        '🗺️ Il mediano che non c\'era' => '🗺️ Der Mittelfeldspieler überall',
+        '📐 Precisione geometrica' => '📐 Geometrische Präzision',
+        '🔄 Polmone inesauribile' => '🔄 Unerschöpflicher Motor',
+        '🌧️ Pioggia battente' => '🌧️ Starker Regen',
+        '☀️ Sole e belle giocate' => '☀️ Sonne und schöner Fußball',
+        '💨 Vento fastidioso' => '💨 Lästiger Wind',
+        '❄️ Freddo polare' => '❄️ Eisige Kälte',
+        '🌫️ Nebbia fitta' => '🌫️ Dichter Nebel',
+        '🟨 Giallo contestato' => '🟨 Umstrittene Gelbe Karte',
+        '📺 VAR protagonista' => '📺 VAR im Mittelpunkt',
+        '🟥 Rosso all\'avversario' => '🟥 Rote Karte für den Gegner',
+        '⚖️ Arbitro contestato' => '⚖️ Schiedsrichter in der Kritik',
+        '🎙️ Il mister in conferenza' => '🎙️ Der Trainer auf der Pressekonferenz',
+        '📋 Piano gara rispettato' => '📋 Spielplan eingehalten',
+        '🔄 Cambio tattico vincente' => '🔄 Siegreicher taktischer Wechsel',
+        '🤔 Mister insoddisfatto' => '🤔 Trainer unzufrieden',
+        '📊 Classifica marcatori' => '📊 Torschützenliste',
+        '📈 Rendimento costante' => '📈 Konstante Leistung',
+        '🏁 Rush finale' => '🏁 Schlussspurt',
+        '🌱 Avvio di stagione' => '🌱 Saisonstart',
+        '💪 Goleada storica!' => '💪 Historische Goleada!',
+        '🤝 Segna ma non basta' => '🤝 Trifft, aber es reicht nicht',
+        '🏆 Vittoria di squadra' => '🏆 Mannschaftssieg',
+        '⚽ Gol annullato' => '⚽ Tor annulliert',
+        '🎊 Doppio assist' => '🎊 Doppelvorlage',
+        '📣 Tifosi in estasi' => '📣 Fans in Ekstase',
+        '🏅 Capitano dell\'anno' => '🏅 Kapitän des Jahres',
+        '⭐ Man of the Match' => '⭐ Spieler des Spiels',
+        '🔥 Forma strepitosa' => '🔥 Hervorragende Form',
+        '📉 Calo fisico' => '📉 Körperlicher Einbruch',
+        '🧠 Intelligenza tattica' => '🧠 Taktische Intelligenz',
+        '💫 Giocata dell\'anno' => '💫 Spielzug des Jahres',
+        '🦁 Carattere da campione' => '🦁 Siegermentalität',
+        '🌊 Rimonta da sogno' => '🌊 Traumkomeback',
+        '🎵 Calcio in musica' => '🎵 Fußball in Harmonie',
+        '🛡️ Muro difensivo' => '🛡️ Defensive Mauer',
+        '🔮 Visione di gioco' => '🔮 Spielsicht',
+        '🎪 Acrobata del pallone' => '🎪 Akrobat mit dem Ball',
+        '🏟️ Stadio in delirio' => '🏟️ Stadion im Delirium',
+        '⚙️ Ingranaggio perfetto' => '⚙️ Perfektes Zahnrad',
+        '🧲 Attaccante letale' => '🧲 Tödlicher Stürmer',
+        '🌈 Spettacolo puro' => '🌈 Reines Spektakel',
+        '😤 Reaction dopo la critica' => '😤 Reaktion nach der Kritik',
+        '🏆 Trofeo conquistato!' => '🏆 Trophäe gewonnen!',
+        '😞 Finale amaro' => '😞 Bitteres Ende',
+        '🥇 Premio individuale' => '🥇 Einzelauszeichnung',
+        '📸 Copertina dei giornali' => '📸 Zeitungscover',
+        '🗣️ Intervista post-partita' => '🗣️ Interview nach dem Spiel',
+        '💰 Rinnovo contratto' => '💰 Vertragsverlängerung',
+        '🌍 Interesse internazionale' => '🌍 Internationales Interesse',
+        '🎓 Crescita personale' => '🎓 Persönliches Wachstum',
+        '🧪 Nuove soluzioni tattiche' => '🧪 Neue taktische Lösungen',
+        '🏃 Preparazione atletica' => '🏃 Athletische Vorbereitung',
+        '🤕 Acciacco muscolare' => '🤕 Muskelbeschwerde',
+        '💊 Cure preventive' => '💊 Vorbeugende Behandlung',
+        '🧘 Equilibrio mentale' => '🧘 Mentale Balance',
+        '📱 Gestione dei social' => '📱 Social-Media-Management',
+        '🤝 Spirito di squadra' => '🤝 Teamgeist',
+        '🌟 Tra i migliori al mondo' => '🌟 Unter den Weltbesten',
+        '🎖️ Stagione da leggenda' => '🎖️ Legendäre Saison',
+        '🔑 Giocatore chiave' => '🔑 Schlüsselspieler',
+        '⚡ Partita in pochi minuti' => '⚡ Spiel in wenigen Minuten entschieden',
+        '🎯 Precisione al millimetro' => '🎯 Millimetergenaue Präzision',
+        '🩹 Rientro dall\'infortunio' => '🩹 Rückkehr nach Verletzung',
+        '📅 Gestione del calendario' => '📅 Kalenderplanung',
+        '🥵 Temperatura record' => '🥵 Rekordtemperatur',
+        '💦 Campo pesante' => '💦 Schwerer Platz',
+        '🏔️ Trasferta difficile' => '🏔️ Schwieriges Auswärtsspiel',
+        '🎤 Intervista esclusiva' => '🎤 Exklusives Interview',
+        '📡 Tutti gli occhi su di te' => '📡 Alle Augen auf dich gerichtet',
+        '🏅 Riconoscimento mensile' => '🏅 Monatliche Auszeichnung',
+        '🤜 Duello diretto' => '🤜 Direktes Duell',
+        '🔁 Secondo tempo dominato' => '🔁 Zweite Halbzeit dominiert',
+        '⏱️ Gol all\'ultimo respiro' => '⏱️ Tor in letzter Sekunde',
+        '🎭 Serata da protagonista' => '🎭 Abend als Hauptdarsteller',
+        '🌙 Serata di Champions' => '🌙 Champions-Abend',
+        '🌺 Il meglio di te' => '🌺 Das Beste von dir',
+        '📊 Record personale!' => '📊 Persönlicher Rekord!',
+        '🏆 Trionfo collettivo' => '🏆 Kollektiver Triumph',
+    ],
+            'es' => [
+        '💥 Potenza devastante' => '💥 Potencia devastadora',
+        '🌀 Magia con l\'esterno' => '🌀 Magia con el exterior',
+        '🎭 RABONA IN PARTITA!' => '🎭 ¡RABONA EN EL PARTIDO!',
+        '👑 Re dell\'aria' => '👑 Rey del aire',
+        '⚡ Velocità della luce' => '⚡ Velocidad de la luz',
+        '🧊 Sangue freddo assoluto' => '🧊 Sangre fría absoluta',
+        '🎯 Istinto puro' => '🎯 Instinto puro',
+        '🧩 Lettura tattica perfetta' => '🧩 Lectura táctica perfecta',
+        '🗺️ Il mediano che non c\'era' => '🗺️ El centrocampista omnipresente',
+        '📐 Precisione geometrica' => '📐 Precisión geométrica',
+        '🔄 Polmone inesauribile' => '🔄 Motor incansable',
+        '🌧️ Pioggia battente' => '🌧️ Lluvia torrencial',
+        '☀️ Sole e belle giocate' => '☀️ Sol y buen juego',
+        '💨 Vento fastidioso' => '💨 Viento molesto',
+        '❄️ Freddo polare' => '❄️ Frío polar',
+        '🌫️ Nebbia fitta' => '🌫️ Niebla espesa',
+        '🟨 Giallo contestato' => '🟨 Amarilla contestada',
+        '📺 VAR protagonista' => '📺 El VAR protagonista',
+        '🟥 Rosso all\'avversario' => '🟥 Roja al rival',
+        '⚖️ Arbitro contestato' => '⚖️ Árbitro cuestionado',
+        '🎙️ Il mister in conferenza' => '🎙️ El entrenador en rueda de prensa',
+        '📋 Piano gara rispettato' => '📋 Plan de juego respetado',
+        '🔄 Cambio tattico vincente' => '🔄 Cambio táctico ganador',
+        '🤔 Mister insoddisfatto' => '🤔 Entrenador insatisfecho',
+        '📊 Classifica marcatori' => '📊 Tabla de goleadores',
+        '📈 Rendimento costante' => '📈 Rendimiento constante',
+        '🏁 Rush finale' => '🏁 Arreón final',
+        '🌱 Avvio di stagione' => '🌱 Inicio de temporada',
+        '💪 Goleada storica!' => '💪 ¡Goleada histórica!',
+        '🤝 Segna ma non basta' => '🤝 Marca pero no es suficiente',
+        '🏆 Vittoria di squadra' => '🏆 Victoria de equipo',
+        '⚽ Gol annullato' => '⚽ Gol anulado',
+        '🎊 Doppio assist' => '🎊 Doble asistencia',
+        '📣 Tifosi in estasi' => '📣 Aficionados en éxtasis',
+        '🏅 Capitano dell\'anno' => '🏅 Capitán del año',
+        '⭐ Man of the Match' => '⭐ Jugador del partido',
+        '🔥 Forma strepitosa' => '🔥 Forma espectacular',
+        '📉 Calo fisico' => '📉 Bajón físico',
+        '🧠 Intelligenza tattica' => '🧠 Inteligencia táctica',
+        '💫 Giocata dell\'anno' => '💫 Jugada del año',
+        '🦁 Carattere da campione' => '🦁 Carácter ganador',
+        '🌊 Rimonta da sogno' => '🌊 Remontada de ensueño',
+        '🎵 Calcio in musica' => '🎵 Fútbol en armonía',
+        '🛡️ Muro difensivo' => '🛡️ Muro defensivo',
+        '🔮 Visione di gioco' => '🔮 Visión de juego',
+        '🎪 Acrobata del pallone' => '🎪 Acróbata del balón',
+        '🏟️ Stadio in delirio' => '🏟️ Estadio en delirio',
+        '⚙️ Ingranaggio perfetto' => '⚙️ Engranaje perfecto',
+        '🧲 Attaccante letale' => '🧲 Delantero letal',
+        '🌈 Spettacolo puro' => '🌈 Espectáculo puro',
+        '😤 Reaction dopo la critica' => '😤 Reacción tras la crítica',
+        '🏆 Trofeo conquistato!' => '🏆 ¡Trofeo conquistado!',
+        '😞 Finale amaro' => '😞 Final amargo',
+        '🥇 Premio individuale' => '🥇 Premio individual',
+        '📸 Copertina dei giornali' => '📸 Portada de los periódicos',
+        '🗣️ Intervista post-partita' => '🗣️ Entrevista post-partido',
+        '💰 Rinnovo contratto' => '💰 Renovación de contrato',
+        '🌍 Interesse internazionale' => '🌍 Interés internacional',
+        '🎓 Crescita personale' => '🎓 Crecimiento personal',
+        '🧪 Nuove soluzioni tattiche' => '🧪 Nuevas soluciones tácticas',
+        '🏃 Preparazione atletica' => '🏃 Preparación atlética',
+        '🤕 Acciacco muscolare' => '🤕 Molestia muscular',
+        '💊 Cure preventive' => '💊 Tratamiento preventivo',
+        '🧘 Equilibrio mentale' => '🧘 Equilibrio mental',
+        '📱 Gestione dei social' => '📱 Gestión de redes sociales',
+        '🤝 Spirito di squadra' => '🤝 Espíritu de equipo',
+        '🌟 Tra i migliori al mondo' => '🌟 Entre los mejores del mundo',
+        '🎖️ Stagione da leggenda' => '🎖️ Temporada de leyenda',
+        '🔑 Giocatore chiave' => '🔑 Jugador clave',
+        '⚡ Partita in pochi minuti' => '⚡ Partido decidido en minutos',
+        '🎯 Precisione al millimetro' => '🎯 Precisión milimétrica',
+        '🩹 Rientro dall\'infortunio' => '🩹 Regreso de la lesión',
+        '📅 Gestione del calendario' => '📅 Gestión del calendario',
+        '🥵 Temperatura record' => '🥵 Temperatura récord',
+        '💦 Campo pesante' => '💦 Campo pesado',
+        '🏔️ Trasferta difficile' => '🏔️ Desplazamiento complicado',
+        '🎤 Intervista esclusiva' => '🎤 Entrevista exclusiva',
+        '📡 Tutti gli occhi su di te' => '📡 Todos los ojos puestos en ti',
+        '🏅 Riconoscimento mensile' => '🏅 Reconocimiento mensual',
+        '🤜 Duello diretto' => '🤜 Duelo directo',
+        '🔁 Secondo tempo dominato' => '🔁 Segunda parte dominada',
+        '⏱️ Gol all\'ultimo respiro' => '⏱️ Gol en el último suspiro',
+        '🎭 Serata da protagonista' => '🎭 Noche estelar',
+        '🌙 Serata di Champions' => '🌙 Noche de Champions',
+        '🌺 Il meglio di te' => '🌺 Lo mejor de ti',
+        '📊 Record personale!' => '📊 ¡Récord personal!',
+        '🏆 Trionfo collettivo' => '🏆 Triunfo colectivo',
+    ],
+        ];
+    }
+    return $maps[$lang][$it] ?? '';
+}
+function _tn(string $it, string $en, string $de = '', string $es = ''): string {
+    $lang = _gsLang();
+    if ($lang === 'en') return $en;
+    if ($lang === 'de') return $de ?: _getGameStringTranslation($it, 'de') ?: $en;
+    if ($lang === 'es') return $es ?: _getGameStringTranslation($it, 'es') ?: $en;
+    return $it;
+}
+function _tna(array $it, array $en, array $de = [], array $es = []): array {
+    $lang = _gsLang();
+    if ($lang === 'en') return $en;
+    if ($lang === 'de') return $de ?: $en;
+    if ($lang === 'es') return $es ?: $en;
+    return $it;
+}
+
+// ── Internal: builds news array in currently active _gsLang ─────────────────
+function _buildNotizie($p, $match, $lega_result, $player_skills = []): array {
+    $anno    = $p['anno_corrente'];
+    $mese    = $p['mese_corrente'];
+    $nome    = $p['player_name'];
+    $overall = intval($p['overall']);
+    $pop     = intval($p['popolarita']);
+    $morale  = intval($p['morale']);
+    $energia = intval($p['energia']);
+    $stelle  = intval($p['team_stelle'] ?? 1);
+    $team    = $p['team_nome_full'] ?? $p['team_nome'] ?? 'la squadra';
+    $notizie = [];
+
+    // Dati aggregati su tutte le partite del mese
+    $partite = $lega_result['msgs'] ?? [];
+    $n_partite = count($partite);
+    $tot_gol   = array_sum(array_column($partite, 'player_gol'));
+    $tot_assist = array_sum(array_column($partite, 'player_assist'));
+    $voti      = array_column($partite, 'player_voto');
+    $voto_medio = $n_partite > 0 ? round(array_sum($voti) / $n_partite, 1) : floatval($match['voto']);
+    $vittorie  = count(array_filter($partite, fn($m) => $m['esito'] === 'V'));
+    $pareggi   = count(array_filter($partite, fn($m) => $m['esito'] === 'P'));
+    $sconfitte = count(array_filter($partite, fn($m) => $m['esito'] === 'S'));
+
+    // Partita migliore (per gol)
+    $best_match = null;
+    foreach ($partite as $pm) {
+        if ($best_match === null || intval($pm['player_gol']) > intval($best_match['player_gol'])) {
+            $best_match = $pm;
+        }
+    }
+    // Usa comunque il match principale per gol_type e dati individuali
+    $gol    = $match['gol'];
+    $assist = $match['assist'];
+    $voto   = $match['voto'];
+    $gol_type = $match['gol_type'] ?? null;
+
+    // ── 1. NOTIZIE SULLE PARTITE (una per ogni partita del mese) ─────────
+    foreach ($partite as $pm) {
+        $avv    = $pm['avv'];
+        $gf     = intval($pm['gf']);
+        $gs     = intval($pm['gs']);
+        $pgol   = intval($pm['player_gol']);
+        $passist = intval($pm['player_assist']);
+        $pvoto  = floatval($pm['player_voto']);
+        $esito  = $pm['esito'];
+        $giornata = $pm['giornata'];
+        $casa   = $pm['isHome'] ? _tn('in casa','at home','zu Hause','en casa') : _tn('in trasferta','away','auswärts','a domicilio');
+
+        if ($esito === 'V') {
+            if ($pgol >= 3) {
+                $titoli = _tna(["🎩 Hat-trick decisivo!", "🔥 Tripletta devastante!", "🎩 Tre gol, tre punti!"],["🎩 Decisive hat-trick!", "🔥 Devastating treble!", "🎩 Three goals, three points!"], ["🎩 Entscheidender Hattrick!","🔥 Verwüstender Dreierpack!","🎩 Drei Tore, drei Punkte!"], ["🎩 ¡Hat-trick decisivo!","🔥 ¡Triplete devastador!","🎩 ¡Tres goles, tres puntos!"]);
+                $testi = _tna(
+                    [
+                    "{$nome} firma una tripletta {$casa} contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. Standing ovation del pubblico — il mister lo abbraccia a fine gara.",
+                    "Hat-trick di {$nome} contro {$avv} alla G{$giornata}: {$gf}-{$gs}. Voto {$pvoto}. 'Non mi fermo mai finché c'è da segnare' — le sue parole nello spogliatoio.",
+                    "Tripletta strepitosa: {$nome} trascina {$team} {$casa} contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. I social esplodono. I top club guardano.",
+                    ],
+                    [
+                    "{$nome} scores a hat-trick {$casa} against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. Standing ovation from the crowd — the coach hugs him at full time.",
+                    "Hat-trick by {$nome} against {$avv} in GW{$giornata}: {$gf}-{$gs}. Rating {$pvoto}. 'I never stop while there are goals to score' — his words in the dressing room.",
+                    "Stunning treble: {$nome} drags {$team} {$casa} against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. Social media explodes. Top clubs are watching.",
+                    ],
+                    [
+                    "{$nome} erzielt einen Hattrick {$casa} gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. Standing Ovations der Fans — der Trainer umarmt ihn nach Schlusspfiff.",
+                    "Hattrick von {$nome} gegen {$avv} am {$giornata}. Spieltag: {$gf}-{$gs}. Note {$pvoto}. 'Ich höre nie auf, solange es Tore zu schießen gibt' — seine Worte in der Kabine.",
+                    "Überragender Dreierpack: {$nome} reißt {$team} {$casa} gegen {$avv} mit ({$gf}-{$gs}). Note {$pvoto}. Die sozialen Medien explodieren. Topklubs schauen zu.",
+                    ],
+                    [
+                    "{$nome} firma un hat-trick {$casa} contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Ovación del público — el entrenador lo abraza al final.",
+                    "Hat-trick de {$nome} contra {$avv} en la J{$giornata}: {$gf}-{$gs}. Nota {$pvoto}. 'Nunca paro mientras haya goles que marcar' — sus palabras en el vestuario.",
+                    "Triplete impresionante: {$nome} arrastra a {$team} {$casa} contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Las redes estallan. Los grandes clubes observan.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'positivo'];
+            } elseif ($pgol >= 2) {
+                $titoli = _tna(["⚽⚽ Doppietta!", "⚽ Ancora in doppia cifra", "⚽⚽ Due reti preziose"],["⚽⚽ Brace!", "⚽ In double figures again", "⚽⚽ Two precious goals"], ["⚽⚽ Doppelpack!","⚽ Wieder doppelt erfolgreich","⚽⚽ Zwei wertvolle Tore"], ["⚽⚽ ¡Doblete!","⚽ De nuevo en doble cifra","⚽⚽ Dos goles preciosos"]);
+                $testi = _tna(
+                    [
+                    "{$nome} firma una doppietta {$casa} contro {$avv}: {$gf}-{$gs}. Voto {$pvoto}. Quando è in giornata non c'è difesa che tenga.",
+                    "Due gol di {$nome} regalano i tre punti a {$team} contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. 'Era una partita difficile, sono soddisfatto'.",
+                    "Doppietta {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} scala la classifica marcatori. Voto {$pvoto}. Il mister: 'È il nostro uomo chiave'.",
+                    ],
+                    [
+                    "{$nome} scores a brace {$casa} against {$avv}: {$gf}-{$gs}. Rating {$pvoto}. When he's on form no defence can hold him.",
+                    "Two goals by {$nome} gift three points to {$team} against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. 'It was a tough game, I'm happy with the result'.",
+                    "Brace {$casa} against {$avv} ({$gf}-{$gs}): {$nome} climbs the top-scorers chart. Rating {$pvoto}. Coach: 'He's our key man'.",
+                    ],
+                    [
+                    "{$nome} erzielt einen Doppelpack {$casa} gegen {$avv}: {$gf}-{$gs}. Note {$pvoto}. Wenn er in Form ist, hält ihn keine Abwehr.",
+                    "Zwei Tore von {$nome} schenken {$team} drei Punkte gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. 'Es war ein schweres Spiel, ich bin zufrieden'.",
+                    "Doppelpack {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} klettert in der Torjägerliste. Note {$pvoto}. Trainer: 'Er ist unser Schlüsselspieler'.",
+                    ],
+                    [
+                    "{$nome} firma un doblete {$casa} contra {$avv}: {$gf}-{$gs}. Nota {$pvoto}. Cuando está en racha ninguna defensa lo detiene.",
+                    "Dos goles de {$nome} regalan tres puntos a {$team} contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. 'Era un partido difícil, estoy satisfecho'.",
+                    "Doblete {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} escala la tabla de goleadores. Nota {$pvoto}. Entrenador: 'Es nuestro hombre clave'.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'positivo'];
+            } elseif ($pgol >= 1 && $passist >= 1) {
+                $titoli = _tna(["🎯 Gol e assist: prestazione totale", "⭐ Decisivo su tutti i fronti", "🎯 Il tuttofare del {$team}"],["🎯 Goal and assist: complete display", "⭐ Decisive on all fronts", "🎯 The jack-of-all-trades of {$team}"], ["🎯 Tor und Vorlage: komplette Leistung","⭐ Auf allen Ebenen entscheidend","🎯 Das Allround-Talent von {$team}"], ["🎯 Gol y asistencia: actuación completa","⭐ Decisivo en todos los frentes","🎯 El todoterreno de {$team}"]);
+                $testi = _tna(
+                    [
+                    "{$nome} firma gol e assist nel {$gf}-{$gs} {$casa} contro {$avv}. Voto {$pvoto}. Coinvolto in quasi ogni azione pericolosa. Dominante.",
+                    "Vittoria {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} con un gol e un assist è l'MVP assoluto. Voto {$pvoto}. 'Quando è in questo stato non si ferma'.",
+                    "Gol, assist e vittoria: {$nome} regala una gioia piena ai tifosi contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. Prestazione da manuale.",
+                    ],
+                    [
+                    "{$nome} scores and assists in the {$gf}-{$gs} {$casa} against {$avv}. Rating {$pvoto}. Involved in almost every dangerous move. Dominant.",
+                    "Win {$casa} against {$avv} ({$gf}-{$gs}): {$nome} with a goal and an assist is the undisputed MVP. Rating {$pvoto}. 'When he's like this, nothing can stop him'.",
+                    "Goal, assist and victory: {$nome} gives the fans pure joy against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. A textbook display.",
+                    ],
+                    [
+                    "{$nome} erzielt Tor und Vorlage beim {$gf}-{$gs} {$casa} gegen {$avv}. Note {$pvoto}. An fast jeder gefährlichen Aktion beteiligt. Dominant.",
+                    "Sieg {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} mit einem Tor und einer Vorlage ist der unbestrittene MVP. Note {$pvoto}. 'Wenn er so ist, kann ihn nichts stoppen'.",
+                    "Tor, Vorlage und Sieg: {$nome} schenkt den Fans pure Freude gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. Eine Leistung wie aus dem Lehrbuch.",
+                    ],
+                    [
+                    "{$nome} firma gol y asistencia en el {$gf}-{$gs} {$casa} contra {$avv}. Nota {$pvoto}. Involucrado en casi cada jugada peligrosa. Dominante.",
+                    "Victoria {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} con un gol y una asistencia es el MVP indiscutible. Nota {$pvoto}. 'Cuando está así, nada lo detiene'.",
+                    "Gol, asistencia y victoria: {$nome} regala pura alegría a la afición contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Una actuación de manual.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'positivo'];
+            } elseif ($pgol >= 1) {
+                $titoli = _tna(["⚽ Il gol della vittoria", "⚽ Segna ancora {$nome}!", "⚽ Rete decisiva"],["⚽ The winning goal", "⚽ {$nome} scores again!", "⚽ Decisive strike"], ["⚽ Das Siegtor","⚽ {$nome} trifft wieder!","⚽ Entscheidender Treffer"], ["⚽ El gol de la victoria","⚽ ¡{$nome} marca otra vez!","⚽ Golpe decisivo"]);
+                $testi = _tna(
+                    [
+                    "Il gol di {$nome} vale tre punti {$casa} contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. 'Ci tenevamo molto a questa vittoria' — nello spogliatoio.",
+                    "{$nome} trova la rete contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. La sua rete sblocca la partita e {$team} non si ferma più.",
+                    "Ancora a segno: {$nome} non sbaglia davanti alla porta e regala la vittoria contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}.",
+                    ],
+                    [
+                    "{$nome}'s goal is worth three points {$casa} against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. 'We really wanted this win' — in the dressing room.",
+                    "{$nome} finds the net against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. His goal unlocks the match and {$team} never look back.",
+                    "On the scoresheet again: {$nome} doesn't miss in front of goal and gifts the win against {$avv} ({$gf}-{$gs}). Rating {$pvoto}.",
+                    ],
+                    [
+                    "Das Tor von {$nome} ist drei Punkte wert {$casa} gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. 'Dieser Sieg war uns sehr wichtig' — in der Kabine.",
+                    "{$nome} trifft gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. Sein Tor bricht den Bann und {$team} ist nicht mehr zu stoppen.",
+                    "Wieder getroffen: {$nome} bleibt vor dem Tor eiskalt und schenkt den Sieg gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}.",
+                    ],
+                    [
+                    "El gol de {$nome} vale tres puntos {$casa} contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. 'Queríamos mucho esta victoria' — en el vestuario.",
+                    "{$nome} encuentra la red contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Su gol desbloquea el partido y {$team} ya no se detiene.",
+                    "De nuevo en el marcador: {$nome} no falla ante la portería y regala la victoria contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}.",
+                    ]);
+                if ($gol_type && isset($gol_type['desc'])) {
+                    $testi[] = _tn(
+                        "Che prodezza di {$nome} contro {$avv} ({$gf}-{$gs}): segna {$gol_type['desc']}. Voto {$pvoto}. Il pubblico in piedi.",
+                        "What a moment from {$nome} against {$avv} ({$gf}-{$gs}): scores {$gol_type['desc']}. Rating {$pvoto}. The crowd on its feet.",
+                        "Was für eine Klasse von {$nome} gegen {$avv} ({$gf}-{$gs}): erzielt {$gol_type['desc']}. Note {$pvoto}. Die Fans stehen.",
+                        "Qué jugada de {$nome} contra {$avv} ({$gf}-{$gs}): marca {$gol_type['desc']}. Nota {$pvoto}. El público en pie."
+                    );
+                }
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0, count($testi)-1)], 'positivo'];
+            } elseif ($passist >= 1) {
+                $titoli = _tna(["🎯 Assist d'oro", "🎯 Il regista della vittoria", "🎯 Decisivo senza segnare"],["🎯 Golden assist", "🎯 The architect of victory", "🎯 Decisive without scoring"],["🎯 Goldene Vorlage", "🎯 Der Architekt des Sieges", "🎯 Entscheidend ohne Tor"],["🎯 Asistencia de oro", "🎯 El arquitecto de la victoria", "🎯 Decisivo sin marcar"]);
+                $testi = _tna(
+                    [
+                    "{$nome} non segna ma il suo assist vale oro: {$team} batte {$avv} {$gf}-{$gs}. Voto {$pvoto}. 'Chi fa assist è bravo quanto chi segna'.",
+                    "È l'assist di {$nome} a spaccare la partita contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. Visione di gioco sopra la media.",
+                    "Servizio perfetto di {$nome} per il {$gf}-{$gs} {$casa} contro {$avv}. Voto {$pvoto}. Il mister lo loda davanti a tutta la squadra.",
+                    ],
+                    [
+                    "{$nome} doesn't score but his assist is gold: {$team} beats {$avv} {$gf}-{$gs}. Rating {$pvoto}. 'A great assist is just as good as a goal'.",
+                    "It's {$nome}'s assist that cracks the game open against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. Vision above the average.",
+                    "Perfect delivery from {$nome} for the {$gf}-{$gs} {$casa} against {$avv}. Rating {$pvoto}. The coach praises him in front of the whole squad.",
+                    ],
+                    [
+                    "{$nome} trifft nicht, aber seine Vorlage ist Gold wert: {$team} schlägt {$avv} {$gf}-{$gs}. Note {$pvoto}. 'Eine Vorlage ist genauso gut wie ein Tor'.",
+                    "Es ist die Vorlage von {$nome}, die das Spiel gegen {$avv} aufbricht ({$gf}-{$gs}). Note {$pvoto}. Übersicht über dem Durchschnitt.",
+                    "Perfekter Pass von {$nome} zum {$gf}-{$gs} {$casa} gegen {$avv}. Note {$pvoto}. Der Trainer lobt ihn vor der ganzen Mannschaft.",
+                    ],
+                    [
+                    "{$nome} no marca pero su asistencia vale oro: {$team} vence a {$avv} {$gf}-{$gs}. Nota {$pvoto}. 'Una buena asistencia vale tanto como un gol'.",
+                    "Es la asistencia de {$nome} la que abre el partido contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Visión de juego por encima de la media.",
+                    "Pase perfecto de {$nome} para el {$gf}-{$gs} {$casa} contra {$avv}. Nota {$pvoto}. El entrenador lo elogia ante toda la plantilla.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'positivo'];
+            } elseif ($pvoto >= 7.5) {
+                $titoli = _tna(["👍 Vittoria e buona prestazione", "🏟️ Tre punti e voto alto", "✅ Solido nella vittoria"],["👍 Win and strong display", "🏟️ Three points and high rating", "✅ Solid in victory"], ["👍 Sieg und starke Leistung","🏟️ Drei Punkte und Topbewertung","✅ Solide beim Sieg"], ["👍 Victoria y buena actuación","🏟️ Tres puntos y nota alta","✅ Sólido en la victoria"]);
+                $testi = _tna(
+                    [
+                    "{$team} vince {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} fa la sua parte con una prestazione ordinata. Voto {$pvoto}. 'Bene così'.",
+                    "Vittoria meritata contro {$avv} ({$gf}-{$gs}): {$nome} contribuisce senza brillare nei numeri, ma il voto {$pvoto} racconta una storia diversa.",
+                    "Tre punti {$casa} contro {$avv} ({$gf}-{$gs}). {$nome} è nella lista dei migliori in campo. Voto {$pvoto}. Il mister sorride.",
+                    ],
+                    [
+                    "{$team} wins {$casa} against {$avv} ({$gf}-{$gs}): {$nome} does his job with a tidy display. Rating {$pvoto}. 'Good job'.",
+                    "Deserved win against {$avv} ({$gf}-{$gs}): {$nome} contributes without shining in stats, but the {$pvoto} rating tells a different story.",
+                    "Three points {$casa} against {$avv} ({$gf}-{$gs}). {$nome} is on the best-on-pitch list. Rating {$pvoto}. The coach smiles.",
+                    ],
+                    [
+                    "{$team} gewinnt {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} macht seine Sache mit einer ordentlichen Leistung. Note {$pvoto}. 'So ist es gut'.",
+                    "Verdienter Sieg gegen {$avv} ({$gf}-{$gs}): {$nome} trägt bei, ohne in den Zahlen zu glänzen, doch die Note {$pvoto} erzählt eine andere Geschichte.",
+                    "Drei Punkte {$casa} gegen {$avv} ({$gf}-{$gs}). {$nome} steht auf der Liste der Besten. Note {$pvoto}. Der Trainer lächelt.",
+                    ],
+                    [
+                    "{$team} gana {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} cumple con una actuación ordenada. Nota {$pvoto}. 'Bien así'.",
+                    "Victoria merecida contra {$avv} ({$gf}-{$gs}): {$nome} contribuye sin brillar en las estadísticas, pero la nota {$pvoto} cuenta otra historia.",
+                    "Tres puntos {$casa} contra {$avv} ({$gf}-{$gs}). {$nome} está en la lista de los mejores del campo. Nota {$pvoto}. El entrenador sonríe.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'positivo'];
+            } else {
+                $titoli = _tna(["🏟️ Vittoria di squadra", "✅ Tre punti conquistati", "🏟️ {$team} vince, {$nome} c'è"],["🏟️ Team victory", "✅ Three points secured", "🏟️ {$team} wins, {$nome} plays"], ["🏟️ Teamsieg","✅ Drei Punkte gesichert","🏟️ {$team} siegt, {$nome} dabei"], ["🏟️ Victoria del equipo","✅ Tres puntos asegurados","🏟️ {$team} gana, {$nome} presente"]);
+                $testi = _tna(
+                    [
+                    "{$team} porta a casa i tre punti contro {$avv} ({$gf}-{$gs}). Per {$nome} una partita di sacrificio. Voto {$pvoto}. Il gruppo è l'importante.",
+                    "Vittoria {$casa} contro {$avv} ({$gf}-{$gs}) ma {$nome} non incide come vorrebbe. Voto {$pvoto}. Deve fare di più per restare titolare.",
+                    "Tre punti {$casa} contro {$avv} ({$gf}-{$gs}). {$nome} ancora a secco, voto {$pvoto}. 'Non mi accontento mai dei risultati di squadra senza contribuire'.",
+                    ],
+                    [
+                    "{$team} takes the three points home against {$avv} ({$gf}-{$gs}). For {$nome} it's a game of pure graft. Rating {$pvoto}. The team is what matters.",
+                    "Win {$casa} against {$avv} ({$gf}-{$gs}) but {$nome} doesn't have the impact he wants. Rating {$pvoto}. Needs to do more to keep his starting spot.",
+                    "Three points {$casa} against {$avv} ({$gf}-{$gs}). {$nome} still blank, rating {$pvoto}. 'I never settle for team results without contributing'.",
+                    ],
+                    [
+                    "{$team} holt die drei Punkte gegen {$avv} ({$gf}-{$gs}). Für {$nome} ein Spiel der Aufopferung. Note {$pvoto}. Die Mannschaft zählt.",
+                    "Sieg {$casa} gegen {$avv} ({$gf}-{$gs}), aber {$nome} hat nicht den gewünschten Einfluss. Note {$pvoto}. Muss mehr tun, um Stammspieler zu bleiben.",
+                    "Drei Punkte {$casa} gegen {$avv} ({$gf}-{$gs}). {$nome} weiter ohne Tor, Note {$pvoto}. 'Ich gebe mich nie mit Mannschaftsergebnissen zufrieden, ohne beizutragen'.",
+                    ],
+                    [
+                    "{$team} se lleva los tres puntos contra {$avv} ({$gf}-{$gs}). Para {$nome} un partido de sacrificio. Nota {$pvoto}. El grupo es lo importante.",
+                    "Victoria {$casa} contra {$avv} ({$gf}-{$gs}) pero {$nome} no incide como quisiera. Nota {$pvoto}. Debe hacer más para mantener la titularidad.",
+                    "Tres puntos {$casa} contra {$avv} ({$gf}-{$gs}). {$nome} aún en blanco, nota {$pvoto}. 'Nunca me conformo con resultados de equipo sin contribuir'.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'info'];
+            }
+        } elseif ($esito === 'P') {
+            if ($pgol >= 1) {
+                $titoli = _tna(["🤝 Pareggio, ma {$nome} segna", "⚽ Gol non basta: si divide", "🤝 Un punto con la firma di {$nome}"],["🤝 Draw, but {$nome} scores", "⚽ Goal not enough: shared points", "🤝 One point with {$nome}'s stamp"], ["🤝 Remis, aber {$nome} trifft","⚽ Tor reicht nicht: Punkteteilung","🤝 Ein Punkt mit {$nome}s Stempel"], ["🤝 Empate, pero {$nome} marca","⚽ El gol no basta: puntos repartidos","🤝 Un punto con la firma de {$nome}"]);
+                $testi = _tna(
+                    [
+                    "{$nome} segna contro {$avv} ma {$team} non riesce a vincere: finisce {$gf}-{$gs}. Voto {$pvoto}. 'Mi aspettavo di più da noi come squadra'.",
+                    "La rete di {$nome} non basta: {$team} e {$avv} si dividono il punto ({$gf}-{$gs}). Voto {$pvoto}. Almeno lui ci ha messo la firma.",
+                    "Pareggio {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} segna ma il risultato lascia l'amaro in bocca. Voto {$pvoto}.",
+                    ],
+                    [
+                    "{$nome} scores against {$avv} but {$team} can't win: it ends {$gf}-{$gs}. Rating {$pvoto}. 'I expected more from us as a team'.",
+                    "{$nome}'s goal isn't enough: {$team} and {$avv} split the points ({$gf}-{$gs}). Rating {$pvoto}. At least he made his mark.",
+                    "Draw {$casa} against {$avv} ({$gf}-{$gs}): {$nome} scores but the result leaves a bitter taste. Rating {$pvoto}.",
+                    ],
+                    [
+                    "{$nome} trifft gegen {$avv}, doch {$team} kann nicht gewinnen: es endet {$gf}-{$gs}. Note {$pvoto}. 'Ich hatte mehr von uns als Mannschaft erwartet'.",
+                    "Das Tor von {$nome} reicht nicht: {$team} und {$avv} teilen die Punkte ({$gf}-{$gs}). Note {$pvoto}. Wenigstens er hat sich eingetragen.",
+                    "Unentschieden {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} trifft, doch das Ergebnis hinterlässt einen bitteren Beigeschmack. Note {$pvoto}.",
+                    ],
+                    [
+                    "{$nome} marca contra {$avv} pero {$team} no logra ganar: termina {$gf}-{$gs}. Nota {$pvoto}. 'Esperaba más de nosotros como equipo'.",
+                    "El gol de {$nome} no basta: {$team} y {$avv} reparten el punto ({$gf}-{$gs}). Nota {$pvoto}. Al menos él puso su firma.",
+                    "Empate {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} marca pero el resultado deja un sabor amargo. Nota {$pvoto}.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'info'];
+            } elseif ($pvoto >= 7.0) {
+                $titoli = _tna(["🤝 Un punto che ha il sapore di qualcosa in più", "🤝 Pareggio a testa alta", "🤝 Punto guadagnato"],["🤝 A point that feels like more", "🤝 Head-held-high draw", "🤝 Point earned"], ["🤝 Ein Punkt der sich wie mehr anfühlt","🤝 Unentschieden erhobenen Hauptes","🤝 Punkt verdient"], ["🤝 Un punto que sabe a más","🤝 Empate con la cabeza alta","🤝 Punto merecido"]);
+                $testi = _tna(
+                    [
+                    "Si ferma sul pareggio {$casa} contro {$avv} ({$gf}-{$gs}), ma {$nome} non è in discussione: voto {$pvoto}. Ha fatto tutto il possibile.",
+                    "{$team} pareggia contro {$avv} ({$gf}-{$gs}): tra i migliori in campo c'è {$nome}, voto {$pvoto}. 'Questo punto ci servirà, vedremo'.",
+                    "Pareggio {$casa} contro {$avv} ({$gf}-{$gs}). {$nome} con voto {$pvoto} è il migliore dei suoi. Ci ha provato fino all'ultimo.",
+                    ],
+                    [
+                    "It ends in a draw {$casa} against {$avv} ({$gf}-{$gs}), but {$nome} is beyond criticism: rating {$pvoto}. He gave everything.",
+                    "{$team} draws against {$avv} ({$gf}-{$gs}): {$nome} is one of the best on the pitch, rating {$pvoto}. 'This point will count, we'll see'.",
+                    "Draw {$casa} against {$avv} ({$gf}-{$gs}). {$nome} with rating {$pvoto} is the best of his team. He tried until the last whistle.",
+                    ],
+                    [
+                    "Es endet mit einem Remis {$casa} gegen {$avv} ({$gf}-{$gs}), aber {$nome} ist über jeden Zweifel erhaben: Note {$pvoto}. Er gab alles.",
+                    "{$team} spielt unentschieden gegen {$avv} ({$gf}-{$gs}): {$nome} ist einer der Besten auf dem Platz, Note {$pvoto}. 'Dieser Punkt wird zählen, wir werden sehen'.",
+                    "Unentschieden {$casa} gegen {$avv} ({$gf}-{$gs}). {$nome} ist mit Note {$pvoto} der Beste seines Teams. Er kämpfte bis zum Schlusspfiff.",
+                    ],
+                    [
+                    "Termina en empate {$casa} contra {$avv} ({$gf}-{$gs}), pero {$nome} está por encima de toda crítica: nota {$pvoto}. Lo dio todo.",
+                    "{$team} empata contra {$avv} ({$gf}-{$gs}): {$nome} es uno de los mejores del campo, nota {$pvoto}. 'Este punto contará, ya veremos'.",
+                    "Empate {$casa} contra {$avv} ({$gf}-{$gs}). {$nome} con nota {$pvoto} es el mejor de los suyos. Lo intentó hasta el último silbato.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'info'];
+            } else {
+                $titoli = _tna(["🤝 Pareggio amaro", "😐 Un punto ma che delusione", "🤝 Meritavamo di più"],["🤝 Bitter draw", "😐 A point but what a disappointment", "🤝 We deserved more"], ["🤝 Bitteres Unentschieden","😐 Ein Punkt, aber welche Enttäuschung","🤝 Wir verdienten mehr"], ["🤝 Empate amargo","😐 Un punto pero qué decepción","🤝 Merecíamos más"]);
+                $testi = _tna(
+                    [
+                    "Pareggio indigesto {$casa} contro {$avv} ({$gf}-{$gs}). {$nome} sparisce dai radar: voto {$pvoto}. Deve ritrovarsi.",
+                    "{$team} non va oltre il pari contro {$avv} ({$gf}-{$gs}): {$nome} sotto tono, voto {$pvoto}. 'Dobbiamo fare meglio, sono il primo a saperlo'.",
+                    "Un punto {$casa} contro {$avv} ({$gf}-{$gs}) ma {$nome} non convince: voto {$pvoto}. Il mister a fine partita parla chiaro nello spogliatoio.",
+                    ],
+                    [
+                    "A hard-to-swallow draw {$casa} against {$avv} ({$gf}-{$gs}). {$nome} goes off the radar: rating {$pvoto}. Needs to find himself.",
+                    "{$team} can't go beyond a draw against {$avv} ({$gf}-{$gs}): {$nome} off the pace, rating {$pvoto}. 'We must do better, I'm the first to know it'.",
+                    "A point {$casa} against {$avv} ({$gf}-{$gs}) but {$nome} doesn't convince: rating {$pvoto}. The coach speaks plainly in the dressing room after.",
+                    ],
+                    [
+                    "Schwer verdauliches Remis {$casa} gegen {$avv} ({$gf}-{$gs}). {$nome} verschwindet vom Radar: Note {$pvoto}. Muss sich wiederfinden.",
+                    "{$team} kommt über ein Remis gegen {$avv} nicht hinaus ({$gf}-{$gs}): {$nome} unter Form, Note {$pvoto}. 'Wir müssen es besser machen, ich weiß es als Erster'.",
+                    "Ein Punkt {$casa} gegen {$avv} ({$gf}-{$gs}), aber {$nome} überzeugt nicht: Note {$pvoto}. Der Trainer findet danach klare Worte in der Kabine.",
+                    ],
+                    [
+                    "Empate indigesto {$casa} contra {$avv} ({$gf}-{$gs}). {$nome} desaparece del radar: nota {$pvoto}. Debe reencontrarse.",
+                    "{$team} no pasa del empate contra {$avv} ({$gf}-{$gs}): {$nome} bajo de tono, nota {$pvoto}. 'Debemos hacerlo mejor, soy el primero en saberlo'.",
+                    "Un punto {$casa} contra {$avv} ({$gf}-{$gs}) pero {$nome} no convence: nota {$pvoto}. El entrenador habla claro en el vestuario al final.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'negativo'];
+            }
+        } else { // Sconfitta
+            $scarto = $gs - $gf;
+            if ($pgol >= 1) {
+                $titoli = _tna(["😔 Gol ma sconfitta", "💔 Non basta il gol di {$nome}", "⚽ Segna, ma la squadra cade"],["😔 Goal but defeat", "💔 {$nome}'s goal not enough", "⚽ Scores, but the team falls"], ["😔 Tor, aber Niederlage","💔 {$nome}s Tor reicht nicht","⚽ Trifft, aber das Team verliert"], ["😔 Gol pero derrota","💔 El gol de {$nome} no alcanza","⚽ Marca, pero el equipo cae"]);
+                $testi = _tna(
+                    [
+                    "{$nome} segna ma non è abbastanza: {$team} perde {$casa} contro {$avv} {$gf}-{$gs}. Voto {$pvoto}. 'Dobbiamo lavorare molto di più'.",
+                    "La rete di {$nome} è un gol della bandiera: {$team} esce sconfitto contro {$avv} ({$gf}-{$gs}). Voto {$pvoto}. Serata difficile.",
+                    "Sconfitta {$casa} contro {$avv} ({$gf}-{$gs}): almeno {$nome} risponde presente con un gol. Voto {$pvoto}. Non è abbastanza, ma la voglia c'è.",
+                    ],
+                    [
+                    "{$nome} scores but it's not enough: {$team} loses {$casa} against {$avv} {$gf}-{$gs}. Rating {$pvoto}. 'We need to work much harder'.",
+                    "{$nome}'s goal is a consolation: {$team} goes down against {$avv} ({$gf}-{$gs}). Rating {$pvoto}. Tough evening.",
+                    "Defeat {$casa} against {$avv} ({$gf}-{$gs}): at least {$nome} steps up with a goal. Rating {$pvoto}. Not enough, but the desire is there.",
+                    ],
+                    [
+                    "{$nome} trifft, doch es reicht nicht: {$team} verliert {$casa} gegen {$avv} {$gf}-{$gs}. Note {$pvoto}. 'Wir müssen viel härter arbeiten'.",
+                    "Das Tor von {$nome} ist nur Ergebniskosmetik: {$team} verliert gegen {$avv} ({$gf}-{$gs}). Note {$pvoto}. Schwerer Abend.",
+                    "Niederlage {$casa} gegen {$avv} ({$gf}-{$gs}): immerhin meldet sich {$nome} mit einem Tor. Note {$pvoto}. Nicht genug, aber der Wille ist da.",
+                    ],
+                    [
+                    "{$nome} marca pero no alcanza: {$team} pierde {$casa} contra {$avv} {$gf}-{$gs}. Nota {$pvoto}. 'Debemos trabajar mucho más'.",
+                    "El gol de {$nome} es de la honra: {$team} cae contra {$avv} ({$gf}-{$gs}). Nota {$pvoto}. Noche difícil.",
+                    "Derrota {$casa} contra {$avv} ({$gf}-{$gs}): al menos {$nome} responde con un gol. Nota {$pvoto}. No basta, pero las ganas están.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'negativo'];
+            } elseif ($scarto >= 3) {
+                $titoli = _tna(["💔 Batosta pesante", "💔 Serata da dimenticare", "📉 Crollo inaspettato"],["💔 Heavy beating", "💔 Night to forget", "📉 Unexpected collapse"], ["💔 Schwere Klatsche","💔 Nacht zum Vergessen","📉 Unerwarteter Einbruch"], ["💔 Paliza pesada","💔 Noche para olvidar","📉 Derrumbe inesperado"]);
+                $testi = _tna(
+                    [
+                    "Notte buia {$casa}: {$avv} travolge {$team} {$gs}-{$gf}. {$nome} sparisce dal campo, voto {$pvoto}. Il mister: 'Dobbiamo ritrovarci'.",
+                    "Sconfitta pesante contro {$avv} ({$gf}-{$gs}). {$nome} irriconoscibile: voto {$pvoto}. Una prestazione da cancellare dalla memoria.",
+                    "{$team} crolla {$casa} contro {$avv} ({$gf}-{$gs}). {$nome} è uno dei peggiori in campo: voto {$pvoto}. Urge una reazione immediata.",
+                    ],
+                    [
+                    "Dark night {$casa}: {$avv} demolishes {$team} {$gs}-{$gf}. {$nome} vanishes from the pitch, rating {$pvoto}. Coach: 'We need to find ourselves'.",
+                    "Heavy defeat against {$avv} ({$gf}-{$gs}). {$nome} unrecognisable: rating {$pvoto}. A display to erase from memory.",
+                    "{$team} collapse {$casa} against {$avv} ({$gf}-{$gs}). {$nome} is one of the worst on the pitch: rating {$pvoto}. An immediate reaction is needed.",
+                    ],
+                    [
+                    "Dunkle Nacht {$casa}: {$avv} überrollt {$team} {$gs}-{$gf}. {$nome} verschwindet vom Platz, Note {$pvoto}. Trainer: 'Wir müssen uns wiederfinden'.",
+                    "Schwere Niederlage gegen {$avv} ({$gf}-{$gs}). {$nome} nicht wiederzuerkennen: Note {$pvoto}. Eine Leistung zum Vergessen.",
+                    "{$team} bricht {$casa} gegen {$avv} ein ({$gf}-{$gs}). {$nome} ist einer der Schwächsten auf dem Platz: Note {$pvoto}. Eine sofortige Reaktion ist nötig.",
+                    ],
+                    [
+                    "Noche oscura {$casa}: {$avv} arrolla a {$team} {$gs}-{$gf}. {$nome} desaparece del campo, nota {$pvoto}. Entrenador: 'Tenemos que reencontrarnos'.",
+                    "Derrota pesada contra {$avv} ({$gf}-{$gs}). {$nome} irreconocible: nota {$pvoto}. Una actuación para borrar de la memoria.",
+                    "{$team} se derrumba {$casa} contra {$avv} ({$gf}-{$gs}). {$nome} es uno de los peores del campo: nota {$pvoto}. Urge una reacción inmediata.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'negativo'];
+            } elseif ($pvoto >= 6.5) {
+                $titoli = _tna(["💔 Sconfitta di misura", "😤 Persi ma a testa alta", "💔 L'impegno c'era, il risultato no"],["💔 Narrow defeat", "😤 Lost but heads held high", "💔 Effort was there, result wasn't"], ["💔 Knappe Niederlage","😤 Verloren, aber Kopf hoch","💔 Einsatz da, Ergebnis nicht"], ["💔 Derrota ajustada","😤 Perdidos pero con la cabeza alta","💔 El esfuerzo estuvo, el resultado no"]);
+                $testi = _tna(
+                    [
+                    "{$team} perde di misura contro {$avv} ({$gf}-{$gs}), ma {$nome} non è in colpa: voto {$pvoto}. Ha lottato fino al fischio finale.",
+                    "Sconfitta {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} con voto {$pvoto} è tra i migliori ma non basta. La squadra deve crescere.",
+                    "Il {$gf}-{$gs} {$casa} contro {$avv} brucia. {$nome} ci ha messo tutto: voto {$pvoto}. 'La prestazione c'era, mancava il gol'.",
+                    ],
+                    [
+                    "{$team} loses narrowly against {$avv} ({$gf}-{$gs}), but {$nome} is not to blame: rating {$pvoto}. He battled until the final whistle.",
+                    "Defeat {$casa} against {$avv} ({$gf}-{$gs}): {$nome} with rating {$pvoto} is among the best but it's not enough. The squad must grow.",
+                    "The {$gf}-{$gs} {$casa} against {$avv} stings. {$nome} gave everything: rating {$pvoto}. 'The performance was there, the goal wasn't'.",
+                    ],
+                    [
+                    "{$team} verliert knapp gegen {$avv} ({$gf}-{$gs}), aber {$nome} trägt keine Schuld: Note {$pvoto}. Er kämpfte bis zum Schlusspfiff.",
+                    "Niederlage {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} mit Note {$pvoto} unter den Besten, doch es reicht nicht. Die Mannschaft muss wachsen.",
+                    "Das {$gf}-{$gs} {$casa} gegen {$avv} schmerzt. {$nome} gab alles: Note {$pvoto}. 'Die Leistung war da, das Tor fehlte'.",
+                    ],
+                    [
+                    "{$team} pierde por la mínima contra {$avv} ({$gf}-{$gs}), pero {$nome} no tiene culpa: nota {$pvoto}. Luchó hasta el pitido final.",
+                    "Derrota {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} con nota {$pvoto} está entre los mejores pero no basta. El equipo debe crecer.",
+                    "El {$gf}-{$gs} {$casa} contra {$avv} duele. {$nome} lo dio todo: nota {$pvoto}. 'La actuación estuvo, faltó el gol'.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'negativo'];
+            } else {
+                $titoli = _tna(["💔 Sconfitta e prestazione opaca", "📉 Momento difficile", "💔 Serata no su tutti i fronti"],["💔 Defeat and poor display", "📉 Difficult spell", "💔 Off-night on all fronts"], ["💔 Niederlage und schwache Leistung","📉 Schwieriger Moment","💔 Absageabend auf allen Ebenen"], ["💔 Derrota y actuación opaca","📉 Momento difícil","💔 Noche negra en todos los frentes"]);
+                $testi = _tna(
+                    [
+                    "Doppia delusione {$casa}: {$team} perde contro {$avv} ({$gf}-{$gs}) e {$nome} è tra i più deludenti. Voto {$pvoto}. Urge svolta.",
+                    "Sconfitta {$casa} contro {$avv} ({$gf}-{$gs}): {$nome} sotto le aspettative, voto {$pvoto}. Il mister chiede di più in conferenza.",
+                    "Una serata da dimenticare in ogni senso: {$team} ko contro {$avv} ({$gf}-{$gs}), {$nome} assente: voto {$pvoto}. Tifosi delusi.",
+                    ],
+                    [
+                    "Double disappointment {$casa}: {$team} loses against {$avv} ({$gf}-{$gs}) and {$nome} is among the worst. Rating {$pvoto}. A turnaround is needed.",
+                    "Defeat {$casa} against {$avv} ({$gf}-{$gs}): {$nome} below expectations, rating {$pvoto}. The coach demands more in the press conference.",
+                    "A night to forget on all fronts: {$team} knocked out against {$avv} ({$gf}-{$gs}), {$nome} absent: rating {$pvoto}. Fans disappointed.",
+                    ],
+                    [
+                    "Doppelte Enttäuschung {$casa}: {$team} verliert gegen {$avv} ({$gf}-{$gs}) und {$nome} gehört zu den Schwächsten. Note {$pvoto}. Eine Wende ist nötig.",
+                    "Niederlage {$casa} gegen {$avv} ({$gf}-{$gs}): {$nome} unter den Erwartungen, Note {$pvoto}. Der Trainer fordert mehr auf der Pressekonferenz.",
+                    "Ein Abend zum Vergessen in jeder Hinsicht: {$team} unterliegt {$avv} ({$gf}-{$gs}), {$nome} abwesend: Note {$pvoto}. Enttäuschte Fans.",
+                    ],
+                    [
+                    "Doble decepción {$casa}: {$team} pierde contra {$avv} ({$gf}-{$gs}) y {$nome} está entre los peores. Nota {$pvoto}. Urge un cambio.",
+                    "Derrota {$casa} contra {$avv} ({$gf}-{$gs}): {$nome} por debajo de las expectativas, nota {$pvoto}. El entrenador exige más en rueda de prensa.",
+                    "Una noche para olvidar en todos los frentes: {$team} cae contra {$avv} ({$gf}-{$gs}), {$nome} ausente: nota {$pvoto}. Afición decepcionada.",
+                    ]);
+                $notizie[] = [$titoli[rand(0,2)], $testi[rand(0,2)], 'negativo'];
+            }
+        }
+    }
+
+    // ── 2. NOTIZIA RIEPILOGATIVA DEL MESE (se più di una partita) ───────
+    if ($n_partite > 1) {
+        $record = "{$vittorie}V {$pareggi}P {$sconfitte}S";
+        if ($vittorie === $n_partite) {
+            $notizie[] = [_tn("🔥 Mese perfetto!", "🔥 Perfect month!", "🔥 Perfekter Monat!", "🔥 ¡Mes perfecto!"), _tn("{$nome} e {$team} vincono tutte le {$n_partite} partite del mese ({$record}). Totale: {$tot_gol} gol e {$tot_assist} assist. Voto medio {$voto_medio}. Un mese straordinario.", "{$nome} and {$team} win all {$n_partite} matches this month ({$record}). Total: {$tot_gol} goals and {$tot_assist} assists. Avg rating {$voto_medio}. An extraordinary month.", "{$nome} und {$team} gewinnen alle {$n_partite} Spiele des Monats ({$record}). Insgesamt: {$tot_gol} Tore und {$tot_assist} Vorlagen. Schnitt {$voto_medio}. Ein außergewöhnlicher Monat.", "{$nome} y {$team} ganan los {$n_partite} partidos del mes ({$record}). Total: {$tot_gol} goles y {$tot_assist} asistencias. Media {$voto_medio}. Un mes extraordinario."), 'positivo'];
+        } elseif ($vittorie >= 2 && $sconfitte === 0) {
+            $notizie[] = [_tn("📈 Mese senza sconfitte", "📈 Unbeaten month", "📈 Monat ohne Niederlage", "📈 Mes invicto"), _tn("Nessuna sconfitta per {$team} in questo mese ({$record}). {$nome} firma {$tot_gol} gol e {$tot_assist} assist. Voto medio {$voto_medio}. Il campionato prende una piega interessante.", "No defeats for {$team} this month ({$record}). {$nome} registers {$tot_gol} goals and {$tot_assist} assists. Avg rating {$voto_medio}. The title race takes an interesting turn.", "Keine Niederlage für {$team} in diesem Monat ({$record}). {$nome} verbucht {$tot_gol} Tore und {$tot_assist} Vorlagen. Schnitt {$voto_medio}. Der Titelkampf wird spannend.", "Sin derrotas para {$team} este mes ({$record}). {$nome} firma {$tot_gol} goles y {$tot_assist} asistencias. Media {$voto_medio}. La lucha por el título se pone interesante."), 'positivo'];
+        } elseif ($sconfitte === $n_partite) {
+            $notizie[] = [_tn("📉 Mese difficile", "📉 Difficult month", "📉 Schwieriger Monat", "📉 Mes difícil"), _tn("{$team} non riesce a vincere nessuna delle {$n_partite} partite ({$record}). {$nome} totalizza {$tot_gol} gol e {$tot_assist} assist, voto medio {$voto_medio}. Serve una reazione.", "{$team} can't win any of the {$n_partite} matches ({$record}). {$nome} tallies {$tot_gol} goals and {$tot_assist} assists, avg rating {$voto_medio}. A reaction is needed.", "{$team} gewinnt keines der {$n_partite} Spiele ({$record}). {$nome} kommt auf {$tot_gol} Tore und {$tot_assist} Vorlagen, Schnitt {$voto_medio}. Eine Reaktion ist nötig.", "{$team} no gana ninguno de los {$n_partite} partidos ({$record}). {$nome} suma {$tot_gol} goles y {$tot_assist} asistencias, media {$voto_medio}. Hace falta una reacción."), 'negativo'];
+        } elseif ($tot_gol >= 4) {
+            $notizie[] = [_tn("⚽ Un mese prolifico", "⚽ A prolific month", "⚽ Ein produktiver Monat", "⚽ Un mes prolífico"), _tn("{$tot_gol} gol e {$tot_assist} assist in {$n_partite} partite: {$nome} è in grande forma offensiva. Record del mese: {$record}. Voto medio {$voto_medio}.", "{$tot_gol} goals and {$tot_assist} assists in {$n_partite} matches: {$nome} is in excellent attacking form. Monthly record: {$record}. Avg rating {$voto_medio}.", "{$tot_gol} Tore und {$tot_assist} Vorlagen in {$n_partite} Spielen: {$nome} ist in glänzender Offensivform. Monatsbilanz: {$record}. Schnitt {$voto_medio}.", "{$tot_gol} goles y {$tot_assist} asistencias en {$n_partite} partidos: {$nome} está en gran forma ofensiva. Registro del mes: {$record}. Media {$voto_medio}."), 'positivo'];
+        } else {
+            $notizie[] = [_tn("📊 Bilancio mensile", "📊 Monthly report", "📊 Monatsbilanz", "📊 Balance mensual"), _tn("{$nome} chiude il mese con {$tot_gol} gol e {$tot_assist} assist in {$n_partite} partite ({$record}). Voto medio {$voto_medio}. C'è ancora margine di crescita.", "{$nome} closes the month with {$tot_gol} goals and {$tot_assist} assists in {$n_partite} matches ({$record}). Avg rating {$voto_medio}. There's still room to grow.", "{$nome} schließt den Monat mit {$tot_gol} Toren und {$tot_assist} Vorlagen in {$n_partite} Spielen ({$record}) ab. Schnitt {$voto_medio}. Es ist noch Luft nach oben.", "{$nome} cierra el mes con {$tot_gol} goles y {$tot_assist} asistencias en {$n_partite} partidos ({$record}). Media {$voto_medio}. Aún hay margen de mejora."), 'info'];
+        }
+    }
+
+    // ── 3. NOTIZIE CONTESTUALI (sempre generate, 2-3 extra) ─────────────
+    {
+        $random_news = [];
+
+        // Basate su overall
+        if ($overall >= 110) {
+            $random_news[] = [_tn("🌍 Icona mondiale", "🌍 World icon", "🌍 Weltikone", "🌍 Icono mundial"), _tn("{$nome} è nella top-5 mondiale. Sondaggio di France Football: 'Sta dominando il calcio di questo decennio'.", "France Football survey: '{$nome} is in the world top-5 and dominating this decade of football'.", "France-Football-Umfrage: '{$nome} gehört zu den Top 5 der Welt und prägt dieses Jahrzehnt des Fußballs'.", "Encuesta de France Football: '{$nome} está entre los 5 mejores del mundo y domina esta década del fútbol'."), 'positivo'];
+            $random_news[] = [_tn("💎 Offerta da favola", "💎 Extraordinary offer", "💎 Außergewöhnliches Angebot", "💎 Oferta extraordinaria"), _tn("Un club misterioso avrebbe presentato un'offerta monstre per {$nome}. Il club: 'Non è in vendita a nessun prezzo'.", "A mystery club reportedly tabled a massive bid for {$nome}. The club: 'Not for sale at any price'.", "Ein mysteriöser Klub soll ein riesiges Angebot für {$nome} abgegeben haben. Der Klub: 'Zu keinem Preis zu verkaufen'.", "Un club misterioso habría presentado una oferta enorme por {$nome}. El club: 'No está en venta a ningún precio'."), 'mercato'];
+        } elseif ($overall >= 95) {
+            $random_news[] = [_tn("🌟 Candidato Pallone d'Oro", "🌟 Ballon d'Or candidate", "🌟 Ballon-d'Or-Kandidat", "🌟 Candidato al Balón de Oro"), _tn("La stampa internazionale inizia a fare i nomi per il Pallone d'Oro: {$nome} è tra i favoriti.", "The international press is shortlisting Ballon d'Or candidates: {$nome} is among the front-runners.", "Die internationale Presse stellt die Ballon-d'Or-Kandidaten zusammen: {$nome} zählt zu den Favoriten.", "La prensa internacional perfila a los candidatos al Balón de Oro: {$nome} está entre los favoritos."), 'positivo'];
+            $random_news[] = [_tn("📺 Intervista esclusiva", "📺 Exclusive interview", "📺 Exklusivinterview", "📺 Entrevista exclusiva"), _tn("{$nome} parla in esclusiva: 'Il mio sogno è vincere tutto con questa maglia. E ci stiamo avvicinando'.", "{$nome} speaks exclusively: 'My dream is to win everything with this shirt. And we're getting closer'.", "{$nome} exklusiv: 'Mein Traum ist es, mit diesem Trikot alles zu gewinnen. Und wir kommen näher'.", "{$nome} habla en exclusiva: 'Mi sueño es ganarlo todo con esta camiseta. Y estamos cada vez más cerca'."), 'info'];
+        } elseif ($overall >= 80) {
+            $random_news[] = [_tn("🗞️ Interesse internazionale", "🗞️ International interest", "🗞️ Internationales Interesse", "🗞️ Interés internacional"), _tn("Media europei iniziano a seguire {$nome}. 'Un giocatore da tenere d'occhio nei prossimi mesi'.", "European media are tracking {$nome}. 'A player to watch in the coming months'.", "Europäische Medien beobachten {$nome}. 'Ein Spieler, den man in den kommenden Monaten im Auge behalten sollte'.", "Los medios europeos siguen a {$nome}. 'Un jugador a seguir en los próximos meses'."), 'info'];
+            $random_news[] = [_tn("💼 Scout in tribuna", "💼 Scout in the stands", "💼 Späher auf der Tribüne", "💼 Ojeador en la grada"), _tn("Diversi osservatori di top club erano sugli spalti ieri. Il bersaglio? Quasi certamente {$nome}.", "Several top-club scouts were in the stands yesterday. The target? Almost certainly {$nome}.", "Mehrere Späher von Topklubs saßen gestern auf der Tribüne. Das Ziel? Mit ziemlicher Sicherheit {$nome}.", "Varios ojeadores de grandes clubes estuvieron ayer en la grada. ¿El objetivo? Casi con seguridad {$nome}."), 'mercato'];
+            $random_news[] = [_tn("📈 Valutazione record", "📈 Record valuation", "📈 Rekordmarktwert", "📈 Valoración récord"), _tn("L'agenzia Transfermarkt ha aggiornato la valutazione di {$nome}: nuovo massimo in carriera.", "Transfermarkt has updated {$nome}'s valuation: a new career high.", "Transfermarkt hat den Marktwert von {$nome} aktualisiert: ein neuer Karrierehöchstwert.", "Transfermarkt ha actualizado la valoración de {$nome}: un nuevo máximo de su carrera."), 'positivo'];
+        } elseif ($overall >= 65) {
+            $random_news[] = [_tn("🔭 Talento emergente", "🔭 Emerging talent", "🔭 Aufstrebendes Talent", "🔭 Talento emergente"), _tn("Il portale specializzato lo inserisce tra i 'prospect da seguire': {$nome} sta bruciando le tappe.", "The specialist portal lists {$nome} among 'prospects to watch': burning through the ranks.", "Das Fachportal führt {$nome} unter den 'Talenten, die man beobachten sollte': er verbrennt die Etappen.", "El portal especializado incluye a {$nome} entre los 'prospectos a seguir': quema etapas."), 'info'];
+        }
+
+        // Basate su popolarità
+        if ($pop >= 90) {
+            $random_news[] = [_tn("📱 Fenomeno social", "📱 Social media phenomenon", "📱 Social-Media-Phänomen", "📱 Fenómeno en redes sociales"), _tn("{$nome} è il calciatore più discusso online questa settimana: milioni di like e condivisioni per il suo ultimo gol.", "{$nome} is the most discussed footballer online this week: millions of likes and shares for the latest goal.", "{$nome} ist diese Woche der meistdiskutierte Fußballer im Netz: Millionen Likes und Shares für das jüngste Tor.", "{$nome} es el futbolista más comentado en la red esta semana: millones de likes y compartidos por su último gol."), 'positivo'];
+            $random_news[] = [_tn("👕 Maglia sold out", "👕 Shirt sold out", "👕 Trikot ausverkauft", "👕 Camiseta agotada"), _tn("La maglia con il numero di {$nome} è esaurita in tutti i negozi. Il merchandising non riesce a stare al passo.", "The shirt bearing {$nome}'s number has sold out everywhere. Merchandising can't keep up.", "Das Trikot mit der Nummer von {$nome} ist überall ausverkauft. Das Merchandising kommt nicht hinterher.", "La camiseta con el número de {$nome} se ha agotado en todas partes. El merchandising no da abasto."), 'positivo'];
+        } elseif ($pop >= 70) {
+            $random_news[] = [_tn("❤️ Beniamino del pubblico", "❤️ Crowd favourite", "❤️ Publikumsliebling", "❤️ Favorito de la afición"), _tn("I tifosi di {$team} hanno eletto {$nome} come giocatore preferito della stagione. Grande affetto dalla curva.", "{$team} fans have voted {$nome} their favourite player of the season. Huge support from the terraces.", "Die Fans von {$team} haben {$nome} zum Lieblingsspieler der Saison gewählt. Riesiger Rückhalt von den Rängen.", "La afición del {$team} ha votado a {$nome} como su jugador favorito de la temporada. Enorme apoyo desde las gradas."), 'positivo'];
+        }
+
+        // Basate su morale
+        if ($morale >= 90) {
+            $random_news[] = [_tn("😄 Un campione felice", "😄 A happy champion", "😄 Ein glücklicher Champion", "😄 Un campeón feliz"), _tn("{$nome} in conferenza: 'Sono nel momento migliore della mia carriera. Voglio continuare così'. Sorrisi e ambizione.", "{$nome} at the presser: 'I'm in the best form of my career. I want to keep this going'. Smiles and ambition.", "{$nome} auf der Pressekonferenz: 'Ich bin in der besten Form meiner Karriere. Das will ich beibehalten'. Lächeln und Ehrgeiz.", "{$nome} en rueda de prensa: 'Estoy en la mejor forma de mi carrera. Quiero mantenerla'. Sonrisas y ambición."), 'positivo'];
+        } elseif ($morale <= 35) {
+            $random_news[] = [_tn("😤 Tensione nello spogliatoio", "😤 Dressing room tension", "😤 Spannung in der Kabine", "😤 Tensión en el vestuario"), _tn("Voci di frizione tra {$nome} e la dirigenza. Il giocatore: 'No comment'. Si naviga a vista.", "Rumours of friction between {$nome} and the board. The player: 'No comment'. Navigating blind.", "Gerüchte über Spannungen zwischen {$nome} und der Vereinsführung. Der Spieler: 'Kein Kommentar'. Blindflug.", "Rumores de fricción entre {$nome} y la directiva. El jugador: 'Sin comentarios'. Navegando a ciegas."), 'negativo'];
+            $random_news[] = [_tn("🌧️ Momento difficile", "🌧️ Difficult spell", "🌧️ Schwierige Phase", "🌧️ Racha difícil"), _tn("{$nome} sta attraversando un periodo complicato. L'entourage: 'Ha bisogno di ritrovare serenità e continuità'.", "{$nome} is going through a difficult patch. The entourage: 'He needs to find serenity and consistency again'.", "{$nome} durchlebt eine schwierige Phase. Das Umfeld: 'Er muss wieder Ruhe und Konstanz finden'.", "{$nome} atraviesa una racha difícil. Su entorno: 'Necesita reencontrar la serenidad y la regularidad'."), 'negativo'];
+        }
+
+        // Basate su energia
+        if ($energia <= 25) {
+            $random_news[] = [_tn("🏥 Allarme fisico", "🏥 Physical alarm", "🏥 Körperlicher Alarm", "🏥 Alarma física"), _tn("Il medico del club trattiene {$nome} dagli allenamenti extra: 'Deve recuperare, rischiamo un infortunio serio'.", "The club doctor has held {$nome} back from extra sessions: 'He must rest — we risk a serious injury'.", "Der Vereinsarzt hat {$nome} von Zusatzeinheiten abgehalten: 'Er muss sich ausruhen — sonst droht eine schwere Verletzung'.", "El médico del club ha frenado a {$nome} en las sesiones extra: 'Debe descansar — arriesgamos una lesión grave'."), 'negativo'];
+        } elseif ($energia >= 90) {
+            $random_news[] = [_tn("💪 Una macchina da guerra", "💪 A war machine", "💪 Eine Kampfmaschine", "💪 Una máquina de guerra"), _tn("{$nome} non si ferma mai. Il preparatore atletico: 'Non ho mai visto nessuno con questa energia a fine stagione'.", "{$nome} never stops. The fitness coach: 'I've never seen anyone with this energy at the end of a season'.", "{$nome} hört nie auf. Der Fitnesstrainer: 'Ich habe noch nie jemanden mit dieser Energie am Saisonende gesehen'.", "{$nome} no para nunca. El preparador físico: 'Nunca he visto a nadie con esta energía al final de una temporada'."), 'positivo'];
+        }
+
+        // Basate su stelle squadra
+        if ($stelle >= 4) {
+            $random_news[] = [_tn("🏆 Stagione cruciale", "🏆 Crucial season", "🏆 Entscheidende Saison", "🏆 Temporada crucial"), _tn("La dirigenza ha indicato {$nome} come la chiave per il titolo. 'Se sta bene lui, stiamo bene tutti'.", "The board has named {$nome} as the key to the title. 'When he's fit, we're all good'.", "Die Vereinsführung hat {$nome} zum Schlüssel für den Titel erklärt. 'Wenn er fit ist, läuft es bei uns allen'.", "La directiva ha señalado a {$nome} como la clave del título. 'Cuando está en forma, todos estamos bien'."), 'info'];
+            $random_news[] = [_tn("💰 Rinnovo in vista", "💰 Renewal on the horizon", "💰 Verlängerung in Sicht", "💰 Renovación en el horizonte"), _tn("Il club vuole blindare {$nome}: pronto un rinnovo di contratto con ingaggio nettamente superiore.", "The club wants to lock down {$nome}: a renewal with a significantly higher wage is ready.", "Der Klub will {$nome} langfristig binden: eine Verlängerung mit deutlich höherem Gehalt liegt bereit.", "El club quiere blindar a {$nome}: hay lista una renovación con un salario notablemente mayor."), 'positivo'];
+        } elseif ($stelle <= 2) {
+            $random_news[] = [_tn("🚀 Troppo forte per questa lega?", "🚀 Too good for this league?", "🚀 Zu gut für diese Liga?", "🚀 ¿Demasiado bueno para esta liga?"), _tn("Gli osservatori sono unanimi: {$nome} ha superato il livello del campionato. Il grande salto è questione di tempo.", "Observers are unanimous: {$nome} has outgrown this league. The big step up is only a matter of time.", "Beobachter sind sich einig: {$nome} ist dieser Liga entwachsen. Der große Schritt ist nur eine Frage der Zeit.", "Los observadores son unánimes: {$nome} se ha quedado grande para esta liga. El gran salto es solo cuestión de tiempo."), 'info'];
+        }
+
+        // Notizie stagionali (basate sul mese)
+        if ($mese == 9) {
+            $random_news[] = [_tn("📅 Nuova stagione, nuovi obiettivi", "📅 New season, new goals", "📅 Neue Saison, neue Ziele", "📅 Nueva temporada, nuevos objetivos"), _tn("{$nome} si presenta al raduno carico: 'Quest'anno voglio portare la squadra più in alto possibile. Ho lavorato duramente'.", "{$nome} arrives at pre-season fired up: 'This year I want to take the team as high as possible. I've worked hard'.", "{$nome} kommt hochmotiviert in die Vorbereitung: 'Dieses Jahr will ich das Team so weit wie möglich bringen. Ich habe hart gearbeitet'.", "{$nome} llega a la pretemporada enchufado: 'Este año quiero llevar al equipo lo más alto posible. He trabajado duro'."), 'info'];
+        } elseif ($mese == 1) {
+            $random_news[] = [_tn("📊 Bilancio di metà stagione", "📊 Mid-season report", "📊 Halbzeitbilanz", "📊 Balance de media temporada"), _tn("A metà campionato {$nome} è tra i migliori della lega. I numeri parlano per lui.", "At the halfway point, {$nome} is among the best in the league. The numbers speak for themselves.", "Zur Saisonhalbzeit gehört {$nome} zu den Besten der Liga. Die Zahlen sprechen für sich.", "En el ecuador de la temporada, {$nome} está entre los mejores de la liga. Los números hablan por sí solos."), 'info'];
+        } elseif ($mese == 6) {
+            $random_news[] = [_tn("🏁 Fine stagione", "🏁 Season over", "🏁 Saison beendet", "🏁 Temporada terminada"), _tn("Si chiude la stagione per {$nome}: mesi di progressi, gol e soddisfazioni. 'Sono pronto per fare ancora meglio'.", "The season ends for {$nome}: months of progress, goals and satisfaction. 'I'm ready to do even better'.", "Die Saison endet für {$nome}: Monate voller Fortschritt, Tore und Zufriedenheit. 'Ich bin bereit, es noch besser zu machen'.", "La temporada termina para {$nome}: meses de progreso, goles y satisfacción. 'Estoy listo para hacerlo aún mejor'."), 'info'];
+        }
+
+        // Notizie curiose/umane (sempre disponibili)
+        $umane = [
+            [_tn("🎙️ Microfono aperto", "🎙️ Open mic", "🎙️ Offenes Mikrofon", "🎙️ Micrófono abierto"), _tn("{$nome} ai microfoni: 'Il calcio è sacrificio, ma quando sento il boato dello stadio capisco perché lo faccio'.", "{$nome} at the mic: 'Football is sacrifice, but when I hear the crowd roar I remember why I do this'.", "{$nome} am Mikrofon: 'Fußball ist Opfer, aber wenn ich die Fans jubeln höre, weiß ich wieder, warum ich das tue'.", "{$nome} ante el micrófono: 'El fútbol es sacrificio, pero cuando oigo rugir a la afición recuerdo por qué hago esto'."), 'info'],
+            [_tn("🎓 Esempio fuori dal campo", "🎓 Role model off the pitch", "🎓 Vorbild neben dem Platz", "🎓 Ejemplo fuera del campo"), _tn("{$nome} ha visitato una scuola della città. 'I bambini sono il futuro del calcio. Voglio essere un modello positivo per loro'.", "{$nome} visited a local school. 'Kids are the future of football. I want to be a positive role model for them'.", "{$nome} besuchte eine örtliche Schule. 'Kinder sind die Zukunft des Fußballs. Ich will ein positives Vorbild für sie sein'.", "{$nome} visitó una escuela local. 'Los niños son el futuro del fútbol. Quiero ser un ejemplo positivo para ellos'."), 'positivo'],
+            [_tn("🍕 La vita del campione", "🍕 Champion's life", "🍕 Das Leben eines Champions", "🍕 La vida de un campeón"), _tn("Reportage sul quotidiano di {$nome}: allenamenti duri, dieta ferrea, e il segreto del suo successo. 'La costanza è tutto'.", "A feature on {$nome}'s daily routine: tough training, strict diet, and the secret to success. 'Consistency is everything'.", "Eine Reportage über den Alltag von {$nome}: hartes Training, strenge Ernährung und das Erfolgsgeheimnis. 'Beständigkeit ist alles'.", "Un reportaje sobre la rutina diaria de {$nome}: entrenamiento duro, dieta estricta y el secreto del éxito. 'La constancia lo es todo'."), 'info'],
+            [_tn("🤝 Leader silenzioso", "🤝 Silent leader", "🤝 Stiller Anführer", "🤝 Líder silencioso"), _tn("I compagni di squadra descrivono {$nome} come il 'collante dello spogliatoio': sempre presente, sempre positivo.", "Teammates describe {$nome} as the 'glue of the dressing room': always present, always positive.", "Mitspieler beschreiben {$nome} als den 'Kitt der Kabine': immer präsent, immer positiv.", "Sus compañeros describen a {$nome} como el 'pegamento del vestuario': siempre presente, siempre positivo."), 'positivo'],
+            [_tn("🔢 Il numero parla", "🔢 The numbers talk", "🔢 Die Zahlen sprechen", "🔢 Los números hablan"), _tn("La statistica della settimana: {$nome} è tra i top-3 della lega per incisività offensiva. I numeri non mentono.", "This week's stat: {$nome} is in the league top-3 for attacking efficiency. Numbers don't lie.", "Statistik der Woche: {$nome} gehört zu den Top 3 der Liga bei der Offensiveffizienz. Zahlen lügen nicht.", "El dato de la semana: {$nome} está entre los 3 mejores de la liga en eficiencia ofensiva. Los números no mienten."), 'info'],
+            [_tn("🗺️ Sogni di gloria", "🗺️ Dreams of glory", "🗺️ Träume von Ruhm", "🗺️ Sueños de gloria"), _tn("Intervista esclusiva: '{$nome} ha ancora tanta fame. Non è qui per accontentarsi', dice il suo procuratore.", "Exclusive interview: '{$nome} is still hungry. He's not here to settle', says his agent.", "Exklusivinterview: '{$nome} ist immer noch hungrig. Er ist nicht hier, um sich zufriedenzugeben', sagt sein Berater.", "Entrevista exclusiva: '{$nome} sigue hambriento. No está aquí para conformarse', dice su agente."), 'info'],
+            [_tn("🏋️ Lavoro extra", "🏋️ Extra work", "🏋️ Zusätzliche Arbeit", "🏋️ Trabajo extra"), _tn("Lo staff tecnico conferma: {$nome} resta in campo dopo ogni allenamento a perfezionare il tiro. 'Un professionista esemplare'.", "The coaching staff confirms: {$nome} stays on the pitch after every session to perfect his shooting. 'An exemplary professional'.", "Der Trainerstab bestätigt: {$nome} bleibt nach jeder Einheit auf dem Platz, um seinen Abschluss zu verfeinern. 'Ein vorbildlicher Profi'.", "El cuerpo técnico confirma: {$nome} se queda en el campo tras cada sesión para perfeccionar su disparo. 'Un profesional ejemplar'."), 'positivo'],
+            [_tn("🌅 La routine del mattino", "🌅 Morning routine", "🌅 Morgenroutine", "🌅 Rutina matutina"), _tn("{$nome} svela la sua routine: sveglia alle 6:30, colazione proteica, corsa di 5 km prima dell'allenamento. 'La disciplina fa la differenza'.", "{$nome} reveals his routine: up at 6:30, protein breakfast, 5 km run before training. 'Discipline makes the difference'.", "{$nome} verrät seine Routine: um 6:30 Uhr aufstehen, Eiweißfrühstück, 5 km Lauf vor dem Training. 'Disziplin macht den Unterschied'.", "{$nome} revela su rutina: levantarse a las 6:30, desayuno proteico, 5 km de carrera antes del entrenamiento. 'La disciplina marca la diferencia'."), 'info'],
+            [_tn("🎭 Il personaggio", "🎭 The character", "🎭 Die Persönlichkeit", "🎭 El personaje"), _tn("Il noto commentatore tv: '{$nome} non è solo un calciatore, è un personaggio che sa stare in campo e fuori. Raro'.", "The well-known TV commentator: '{$nome} is not just a footballer — he's a personality on and off the pitch. Rare'.", "Der bekannte TV-Kommentator: '{$nome} ist nicht nur ein Fußballer — er ist eine Persönlichkeit auf und neben dem Platz. Selten'.", "El conocido comentarista de televisión: '{$nome} no es solo un futbolista — es una personalidad dentro y fuera del campo. Algo raro'."), 'positivo'],
+            [_tn("🤸 Elasticità mentale", "🤸 Mental resilience", "🤸 Mentale Widerstandskraft", "🤸 Resiliencia mental"), _tn("Il preparatore atletico rivela: '{$nome} ha una capacità di recupero mentale straordinaria. Dopo una partita negativa torna sempre più forte'.", "The fitness coach reveals: '{$nome} has extraordinary mental recovery. After a bad game he always comes back stronger'.", "Der Fitnesstrainer verrät: '{$nome} hat eine außergewöhnliche mentale Erholung. Nach einem schlechten Spiel kommt er immer stärker zurück'.", "El preparador físico revela: '{$nome} tiene una recuperación mental extraordinaria. Tras un mal partido siempre vuelve más fuerte'."), 'positivo'],
+            [_tn("📚 Il lettore di notte", "📚 The night reader", "📚 Der nächtliche Leser", "📚 El lector nocturno"), _tn("Curiosità: {$nome} legge libri di psicologia sportiva ogni notte prima di dormire. 'La mente è il muscolo più importante'.", "Fun fact: {$nome} reads sports psychology books every night before sleeping. 'The mind is the most important muscle'.", "Kurioses: {$nome} liest jeden Abend vor dem Schlafen Bücher über Sportpsychologie. 'Der Kopf ist der wichtigste Muskel'.", "Curiosidad: {$nome} lee libros de psicología deportiva cada noche antes de dormir. 'La mente es el músculo más importante'."), 'info'],
+            [_tn("🌡️ Condizioni al limite", "🌡️ Playing through it", "🌡️ Trotz allem auf dem Platz", "🌡️ Jugando con molestias"), _tn("Con la febbre, {$nome} ha comunque partecipato all'allenamento. Il medico: 'È ingestibile, nel senso migliore'.", "Despite a fever, {$nome} still showed up to training. The doctor: 'He's unmanageable — in the best possible way'.", "Trotz Fieber erschien {$nome} zum Training. Der Arzt: 'Er ist nicht zu bändigen — im besten Sinne'.", "A pesar de la fiebre, {$nome} se presentó al entrenamiento. El médico: 'Es ingobernable — en el mejor sentido'."), 'positivo'],
+            [_tn("🤝 Compagni di viaggio", "🤝 Road companions", "🤝 Weggefährten", "🤝 Compañeros de viaje"), _tn("I compagni di squadra confermano: '{$nome} è il primo ad arrivare e l'ultimo a uscire. Questo ci ispira tutti'.", "Teammates confirm: '{$nome} is the first to arrive and the last to leave. It inspires all of us'.", "Die Mitspieler bestätigen: '{$nome} kommt als Erster und geht als Letzter. Das inspiriert uns alle'.", "Los compañeros confirman: '{$nome} es el primero en llegar y el último en irse. Nos inspira a todos'."), 'positivo'],
+            [_tn("🎩 Eleganza fuori campo", "🎩 Off-pitch elegance", "🎩 Eleganz neben dem Platz", "🎩 Elegancia fuera del campo"), _tn("Premiato come 'Calciatore più elegante' dalla rivista di moda locale. {$nome}: 'Curarsi nell'aspetto è rispetto per se stessi e per gli altri'.", "Awarded 'Most Stylish Player' by a local fashion magazine. {$nome}: 'Looking after your appearance is respect for yourself and others'.", "Von einem lokalen Modemagazin zum 'stilvollsten Spieler' gekürt. {$nome}: 'Auf sein Äußeres zu achten ist Respekt vor sich selbst und anderen'.", "Premiado como 'Jugador más elegante' por una revista de moda local. {$nome}: 'Cuidar la apariencia es respeto hacia uno mismo y los demás'."), 'info'],
+            [_tn("📱 Influencer involontario", "📱 Accidental influencer", "📱 Zufälliger Influencer", "📱 Influencer accidental"), _tn("Ogni foto di {$nome} raggiunge mezzo milione di like. 'Non lo faccio per i like. Lo faccio perché mi diverte condividere', dice.", "Every photo of {$nome} hits half a million likes. 'I don't do it for likes. I do it because I enjoy sharing', he says.", "Jedes Foto von {$nome} erreicht eine halbe Million Likes. 'Ich mache das nicht für Likes. Ich teile einfach gern', sagt er.", "Cada foto de {$nome} alcanza medio millón de likes. 'No lo hago por los likes. Lo hago porque me gusta compartir', dice."), 'info'],
+            [_tn("🌿 Green player", "🌿 Grüner Spieler", "🌿 Jugador ecológico", "🌿 Green player"), _tn("{$nome} partecipa attivamente alla campagna 'Carbon Zero' del club: pannelli solari alla sua abitazione e auto elettrica.", "{$nome} actively supports the club's 'Carbon Zero' campaign: solar panels at home and an electric car.", "{$nome} unterstützt aktiv die 'Carbon Zero'-Kampagne des Klubs: Solarpaneele zu Hause und ein Elektroauto.", "{$nome} apoya activamente la campaña 'Carbono Cero' del club: paneles solares en casa y un coche eléctrico."), 'positivo'],
+            [_tn("🔑 Le chiavi dello spogliatoio", "🔑 Keys to the dressing room", "🔑 Schlüssel zur Kabine", "🔑 Llaves del vestuario"), _tn("Il custode dello stadio racconta: '{$nome} entra sempre con un sorriso e se ne va per ultimo, spesso aiutando a raccogliere le palle'.", "The stadium caretaker says: '{$nome} always comes in smiling and leaves last, often helping collect the balls'.", "Der Stadionwart sagt: '{$nome} kommt immer lächelnd herein und geht als Letzter, oft hilft er, die Bälle einzusammeln'.", "El encargado del estadio dice: '{$nome} siempre entra sonriendo y se va el último, a menudo ayudando a recoger los balones'."), 'positivo'],
+            [_tn("🎯 L'obiettivo dichiarato", "🎯 The declared goal", "🎯 Das erklärte Ziel", "🎯 El objetivo declarado"), _tn("In un'intervista rara, {$nome} ammette: 'Il mio sogno è il Pallone d\\'Oro. Lo dico apertamente perché i sogni si raggiungono solo se ci credi davvero'.", "In a rare interview, {$nome} admits: 'My dream is the Ballon d\\'Or. I say it openly because dreams only come true if you truly believe'.", "In einem seltenen Interview gibt {$nome} zu: 'Mein Traum ist der Ballon d\\'Or. Ich sage es offen, denn Träume werden nur wahr, wenn man wirklich daran glaubt'.", "En una rara entrevista, {$nome} admite: 'Mi sueño es el Balón de Oro. Lo digo abiertamente porque los sueños solo se cumplen si crees de verdad'."), 'positivo'],
+            [_tn("🏅 Il passato promettente", "🏅 A promising past", "🏅 Eine vielversprechende Vergangenheit", "🏅 Un pasado prometedor"), _tn("Un ex tecnico del settore giovanile ricorda {$nome}: 'Già a 14 anni vedevi che sarebbe diventato qualcosa di speciale. Aveva fame'.", "A former youth coach recalls {$nome}: 'Even at 14 you could see he'd become something special. He had hunger'.", "Ein ehemaliger Jugendtrainer erinnert sich an {$nome}: 'Schon mit 14 sah man, dass er etwas Besonderes wird. Er hatte Hunger'.", "Un ex entrenador de las categorías inferiores recuerda a {$nome}: 'Ya con 14 años se veía que sería algo especial. Tenía hambre'."), 'info'],
+            [_tn("👟 Scarpe porta-fortuna", "👟 Lucky boots", "👟 Glücksschuhe", "👟 Botas de la suerte"), _tn("{$nome} gioca sempre con lo stesso modello di scarpe da 3 anni: 'Sono scaramantiche. Non le cambio finché continuano a portarmi gol'.", "{$nome} has played in the same boot model for 3 years: 'They're lucky. I won't change them as long as they keep bringing me goals'.", "{$nome} spielt seit 3 Jahren im selben Schuhmodell: 'Sie bringen Glück. Ich wechsle sie nicht, solange sie mir Tore bringen'.", "{$nome} juega con el mismo modelo de botas desde hace 3 años: 'Dan suerte. No las cambiaré mientras me sigan dando goles'."), 'info'],
+            [_tn("🎙️ Radio sport", "🎙️ Sports radio", "🎙️ Sportradio", "🎙️ Radio deportiva"), _tn("Intervistato alla radio, {$nome} risponde alle domande dei tifosi per un'ora intera: 'È il minimo che posso fare per chi mi supporta ogni settimana'.", "On the radio, {$nome} answered fan questions for a full hour: 'It's the least I can do for those who support me every week'.", "Im Radio beantwortete {$nome} eine ganze Stunde lang Fanfragen: 'Das ist das Mindeste für die, die mich jede Woche unterstützen'.", "En la radio, {$nome} respondió a las preguntas de la afición durante una hora entera: 'Es lo mínimo que puedo hacer por quienes me apoyan cada semana'."), 'positivo'],
+            [_tn("🍽️ Cena di squadra", "🍽️ Team dinner", "🍽️ Mannschaftsessen", "🍽️ Cena de equipo"), _tn("La tradizionale cena di squadra mensile: {$nome} ha cucinato lui stesso un piatto tipico della sua regione. I compagni: 'Cucina meglio di quanto giochi!'", "The traditional monthly team dinner: {$nome} cooked a local dish himself. Teammates: 'He cooks better than he plays!'", "Das traditionelle monatliche Mannschaftsessen: {$nome} kochte selbst ein lokales Gericht. Die Mitspieler: 'Er kocht besser als er spielt!'", "La tradicional cena mensual del equipo: {$nome} cocinó él mismo un plato local. Sus compañeros: '¡Cocina mejor de lo que juega!'"), 'info'],
+        ];
+        $random_news[] = $umane[rand(0, count($umane)-1)];
+
+        // Scegli sempre 2 notizie contestuali
+        if (!empty($random_news)) {
+            shuffle($random_news);
+            $notizie[] = $random_news[0];
+            if (count($random_news) > 1) {
+                $notizie[] = $random_news[1];
+            }
+        }
+    }
+
+    // ── 4. NOTIZIA EVENTO SPECIALE (70% probabilità) ─────────────────
+    if (rand(1,100) <= 70) {
+        $eventi = [
+            [_tn("🎲 Colpo di scena in campionato", "🎲 Shock result in the league", "🎲 Überraschung in der Liga", "🎲 Resultado sorpresa en la liga"), _tn("Risultati a sorpresa nell'ultimo turno. {$nome} e {$team} devono restare concentrati: la classifica è ancora aperta.", "Surprise results last weekend. {$nome} and {$team} must stay focused: the table is wide open.", "Überraschende Ergebnisse am letzten Wochenende. {$nome} und {$team} müssen konzentriert bleiben: die Tabelle ist völlig offen.", "Resultados sorpresa el último fin de semana. {$nome} y {$team} deben mantener la concentración: la tabla está muy abierta."), 'info'],
+            [_tn("🌦️ Derby in arrivo", "🌦️ Derby incoming", "🌦️ Derby steht an", "🌦️ Se acerca el derbi"), _tn("Si avvicina il derby locale. L'ambiente è elettrico e {$nome} è il giocatore più atteso dai tifosi.", "The local derby is approaching. The atmosphere is electric and {$nome} is the most anticipated player.", "Das Stadtderby steht bevor. Die Stimmung ist elektrisierend und {$nome} ist der am meisten erwartete Spieler.", "Se acerca el derbi local. El ambiente es eléctrico y {$nome} es el jugador más esperado."), 'info'],
+            [_tn("🔄 Mercato di riparazione", "🔄 January window", "🔄 Wintertransferfenster", "🔄 Mercado de enero"), _tn("Si apre la sessione invernale. Il nome di {$nome} circola nei corridoi dei top club europei.", "The winter window opens. {$nome}'s name is circulating in the corridors of Europe's top clubs.", "Das Wintertransferfenster öffnet. Der Name {$nome} kursiert in den Fluren der europäischen Topklubs.", "Se abre el mercado de invierno. El nombre de {$nome} circula por los pasillos de los grandes clubes de Europa."), 'mercato'],
+            [_tn("🏋️ Allenamento intensivo", "🏋️ Intense training", "🏋️ Intensives Training", "🏋️ Entrenamiento intenso"), _tn("Il mister ha intensificato i carichi di lavoro. {$nome} è tra i più diligenti: 'Voglio arrivare al top della forma'.", "The manager has ramped up training loads. {$nome} is among the most diligent: 'I want to reach peak form'.", "Der Trainer hat die Trainingsbelastung erhöht. {$nome} gehört zu den Fleißigsten: 'Ich will in Topform kommen'.", "El entrenador ha aumentado las cargas de entrenamiento. {$nome} es de los más aplicados: 'Quiero llegar a mi mejor forma'."), 'info'],
+            [_tn("🌍 Nazionale", "🌍 National team", "🌍 Nationalmannschaft", "🌍 Selección nacional"), _tn("Il ct della Nazionale ha osservato {$nome} di persona. Una convocazione potrebbe essere vicina.", "The national team coach has watched {$nome} in person. A call-up could be on the horizon.", "Der Nationaltrainer hat {$nome} persönlich beobachtet. Eine Nominierung könnte bevorstehen.", "El seleccionador nacional ha visto a {$nome} en persona. Una convocatoria podría estar cerca."), 'positivo'],
+            [_tn("📰 Copertina", "📰 Front page", "📰 Titelseite", "📰 Portada"), _tn("{$nome} finisce in copertina sul principale quotidiano sportivo. Foto in grande e titolo: 'Il futuro del calcio'.", "{$nome} lands on the front page of the leading sports paper. Big photo, big headline: 'The future of football'.", "{$nome} landet auf der Titelseite der führenden Sportzeitung. Großes Foto, große Schlagzeile: 'Die Zukunft des Fußballs'.", "{$nome} aparece en la portada del principal diario deportivo. Gran foto, gran titular: 'El futuro del fútbol'."), 'positivo'],
+            [_tn("🎁 Sponsor nuovo", "🎁 New sponsor", "🎁 Neuer Sponsor", "🎁 Nuevo patrocinador"), _tn("Un importante brand sportivo ha proposto a {$nome} un accordo di sponsorizzazione. L'entourage sta valutando.", "A major sports brand has approached {$nome} with a sponsorship deal. His entourage is considering it.", "Eine große Sportmarke ist mit einem Sponsoringangebot an {$nome} herangetreten. Sein Umfeld prüft es.", "Una gran marca deportiva ha contactado a {$nome} con un acuerdo de patrocinio. Su entorno lo está estudiando."), 'info'],
+            [_tn("💬 Conferenza stampa", "💬 Press conference", "💬 Pressekonferenz", "💬 Rueda de prensa"), _tn("In conferenza {$nome} risponde alle domande sul suo futuro: 'Sto benissimo qui, voglio vincere con questa squadra'.", "At the presser, {$nome} responds to questions about his future: 'I'm very happy here, I want to win with this team'.", "Auf der Pressekonferenz antwortet {$nome} auf Fragen zu seiner Zukunft: 'Ich bin sehr glücklich hier, ich will mit diesem Team gewinnen'.", "En rueda de prensa, {$nome} responde a las preguntas sobre su futuro: 'Estoy muy feliz aquí, quiero ganar con este equipo'."), 'info'],
+            [_tn("🩺 Check medico", "🩺 Medical check", "🩺 Ärztliche Untersuchung", "🩺 Revisión médica"), _tn("Controllo di routine per {$nome}: tutto ok secondo lo staff medico. 'È in perfetta forma fisica'.", "Routine check-up for {$nome}: all clear from the medical staff. 'He's in perfect physical shape'.", "Routineuntersuchung für {$nome}: grünes Licht vom medizinischen Stab. 'Er ist in perfekter körperlicher Verfassung'.", "Revisión rutinaria para {$nome}: visto bueno del cuerpo médico. 'Está en perfecta forma física'."), 'info'],
+            [_tn("🔥 Rivalità accesa", "🔥 Heated rivalry", "🔥 Hitzige Rivalität", "🔥 Rivalidad encendida"), _tn("Cresce la rivalità con un altro top player della lega. I media adorano questo duello. Chi sarà il migliore a fine anno?", "The rivalry with another league top player is heating up. The media love this duel. Who will be best at year's end?", "Die Rivalität mit einem anderen Topspieler der Liga spitzt sich zu. Die Medien lieben dieses Duell. Wer ist am Jahresende der Beste?", "La rivalidad con otro gran jugador de la liga se calienta. A los medios les encanta este duelo. ¿Quién será el mejor al final del año?"), 'info'],
+            [_tn("📣 La stampa parla di te", "📣 The press is talking", "📣 Die Presse spricht", "📣 La prensa habla"), _tn("Tre testate sportive diverse citano {$nome} nell'analisi del turno. 'Un giocatore che non si può ignorare', scrive il più autorevole.", "Three different sports outlets mention {$nome} in their match analysis. 'A player you can't ignore', writes the most authoritative.", "Drei verschiedene Sportmedien erwähnen {$nome} in ihrer Spielanalyse. 'Ein Spieler, den man nicht ignorieren kann', schreibt das angesehenste.", "Tres medios deportivos distintos mencionan a {$nome} en su análisis del partido. 'Un jugador imposible de ignorar', escribe el más autorizado."), 'positivo'],
+            [_tn("🧠 Il mister in conferenza", "🧠 Manager in conference", "🧠 Trainer auf der Pressekonferenz", "🧠 Entrenador en rueda de prensa"), _tn("Domanda sulla classifica, risposta che riguarda {$nome}: 'Se lui è in condizione, possiamo battere chiunque'. Il mister non ha dubbi.", "Asked about the table, the manager pivots to {$nome}: 'When he's fit, we can beat anyone'. No doubts from the boss.", "Auf die Tabelle angesprochen, lenkt der Trainer auf {$nome}: 'Wenn er fit ist, können wir jeden schlagen'. Keine Zweifel vom Chef.", "Preguntado por la tabla, el entrenador desvía hacia {$nome}: 'Cuando está en forma, podemos ganar a cualquiera'. Sin dudas por parte del jefe."), 'positivo'],
+            [_tn("🎰 Quote in discesa", "🎰 Odds tumbling", "🎰 Fallende Quoten", "🎰 Cuotas a la baja"), _tn("Le agenzie di scommesse hanno abbassato le quote scudetto del {$team} dopo le ultime prestazioni. {$nome} è indicato come il fattore X.", "Bookmakers have slashed {$team}'s title odds after recent performances. {$nome} is cited as the X factor.", "Die Buchmacher haben die Titelquote von {$team} nach den jüngsten Leistungen gesenkt. {$nome} gilt als der X-Faktor.", "Las casas de apuestas han recortado la cuota de {$team} para el título tras los últimos resultados. Se cita a {$nome} como el factor X."), 'info'],
+            [_tn("🏖️ Vacanza meritata", "🏖️ Well-earned break", "🏖️ Wohlverdiente Pause", "🏖️ Descanso merecido"), _tn("{$nome} ha staccato la spina qualche giorno prima della ripresa. 'Mi ha fatto bene. Sono pronto a dare tutto', ha dichiarato al rientro.", "{$nome} switched off for a few days before the restart. 'It did me good. I'm ready to give everything', he said on return.", "{$nome} schaltete vor dem Neustart ein paar Tage ab. 'Es hat mir gutgetan. Ich bin bereit, alles zu geben', sagte er bei der Rückkehr.", "{$nome} desconectó unos días antes de la reanudación. 'Me sentó bien. Estoy listo para darlo todo', dijo a su regreso."), 'info'],
+            [_tn("🌿 Stile di vita sano", "🌿 Healthy lifestyle", "🌿 Gesunder Lebensstil", "🌿 Estilo de vida saludable"), _tn("Reportage esclusivo: la dieta rigida di {$nome}, seguita da un nutrizionista di fama internazionale. 'Il fisico è il mio strumento di lavoro'.", "Exclusive feature: {$nome}'s strict diet, overseen by a world-renowned nutritionist. 'My body is my work tool'.", "Exklusivreportage: die strenge Ernährung von {$nome}, betreut von einem weltbekannten Ernährungsberater. 'Mein Körper ist mein Arbeitsgerät'.", "Reportaje exclusivo: la estricta dieta de {$nome}, supervisada por un nutricionista de renombre mundial. 'Mi cuerpo es mi herramienta de trabajo'."), 'info'],
+            [_tn("🤲 Beneficenza", "🤲 Charity", "🤲 Wohltätigkeit", "🤲 Solidaridad"), _tn("{$nome} ha devoluto parte del suo stipendio alla fondazione locale. 'Avere i piedi per terra è fondamentale per un calciatore'.", "{$nome} has donated part of his wages to the local foundation. 'Staying grounded is essential for a footballer'.", "{$nome} hat einen Teil seines Gehalts an die lokale Stiftung gespendet. 'Auf dem Boden zu bleiben ist für einen Fußballer essenziell'.", "{$nome} ha donado parte de su salario a la fundación local. 'Mantener los pies en la tierra es esencial para un futbolista'."), 'positivo'],
+            [_tn("🏫 Scuola di calcio", "🏫 Football school", "🏫 Fußballschule", "🏫 Escuela de fútbol"), _tn("{$nome} ha visitato la scuola calcio del {$team}. 'I bambini sono il futuro. Spero che uno di loro mi sostituisca un giorno', ha scherzato.", "{$nome} visited {$team}'s football academy. 'Kids are the future. I hope one of them replaces me one day', he joked.", "{$nome} besuchte die Fußballakademie von {$team}. 'Die Kinder sind die Zukunft. Ich hoffe, einer von ihnen ersetzt mich eines Tages', scherzte er.", "{$nome} visitó la academia de fútbol del {$team}. 'Los niños son el futuro. Espero que uno de ellos me reemplace algún día', bromeó."), 'positivo'],
+            [_tn("🔬 Tecnologia e calcio", "🔬 Tech and football", "🔬 Technik und Fußball", "🔬 Tecnología y fútbol"), _tn("Il {$team} ha introdotto nuovi sensori GPS per monitorare le prestazioni. {$nome}: 'I dati confermano quello che sentivo: sto migliorando'.", "{$team} has introduced new GPS sensors to monitor performance. {$nome}: 'The data confirms what I felt: I'm improving'.", "{$team} hat neue GPS-Sensoren zur Leistungsüberwachung eingeführt. {$nome}: 'Die Daten bestätigen, was ich gespürt habe: ich werde besser'.", "{$team} ha introducido nuevos sensores GPS para monitorizar el rendimiento. {$nome}: 'Los datos confirman lo que sentía: estoy mejorando'."), 'info'],
+            [_tn("🧘 Meditazione pre-partita", "🧘 Pre-match meditation", "🧘 Meditation vor dem Spiel", "🧘 Meditación antes del partido"), _tn("Il segreto di {$nome}? Quindici minuti di meditazione prima di ogni gara. 'La testa è importante quanto le gambe nel calcio moderno'.", "The secret of {$nome}? Fifteen minutes of meditation before every match. 'The mind matters as much as the legs in modern football'.", "Das Geheimnis von {$nome}? Fünfzehn Minuten Meditation vor jedem Spiel. 'Im modernen Fußball zählt der Kopf so viel wie die Beine'.", "¿El secreto de {$nome}? Quince minutos de meditación antes de cada partido. 'En el fútbol moderno la mente importa tanto como las piernas'."), 'positivo'],
+            [_tn("🌐 Viral in 20 paesi", "🌐 Viral in 20 countries", "🌐 Viral in 20 Ländern", "🌐 Viral en 20 países"), _tn("Il video del gol di {$nome} della settimana scorsa è diventato virale: 42 milioni di visualizzazioni in meno di 48 ore.", "Last week's goal by {$nome} went viral: 42 million views in under 48 hours.", "Das Tor von {$nome} aus der Vorwoche ging viral: 42 Millionen Aufrufe in unter 48 Stunden.", "El gol de {$nome} de la semana pasada se hizo viral: 42 millones de visualizaciones en menos de 48 horas."), 'positivo'],
+            [_tn("⚡ Record di velocità", "⚡ Speed record", "⚡ Geschwindigkeitsrekord", "⚡ Récord de velocidad"), _tn("I sensori GPS rivelano: {$nome} ha raggiunto i 36 km/h in campo questa settimana. Tra i più veloci del campionato.", "GPS sensors reveal: {$nome} hit 36 km/h on the pitch this week. Among the fastest in the league.", "GPS-Sensoren zeigen: {$nome} erreichte diese Woche 36 km/h auf dem Platz. Einer der Schnellsten der Liga.", "Los sensores GPS revelan: {$nome} alcanzó los 36 km/h en el campo esta semana. Entre los más rápidos de la liga."), 'positivo'],
+            [_tn("🎯 Precisione da manuale", "🎯 Textbook precision", "🎯 Präzision wie aus dem Lehrbuch", "🎯 Precisión de manual"), _tn("Statistiche impietose per gli avversari: {$nome} ha una percentuale di conversione del 32% sui tiri in porta. Da paura.", "Brutal stats for opponents: {$nome} has a 32% conversion rate on shots on target. Frightening.", "Brutale Statistik für die Gegner: {$nome} hat eine Verwertungsquote von 32 % bei Schüssen aufs Tor. Furchteinflößend.", "Estadísticas brutales para los rivales: {$nome} tiene un 32 % de conversión en disparos a puerta. Da miedo."), 'positivo'],
+            [_tn("🔔 Notifica di mercato", "🔔 Transfer notification", "🔔 Transfer-Benachrichtigung", "🔔 Notificación de fichaje"), _tn("Corriere dello Sport: '{$nome} cercato da tre club di Premier League'. Il {$team} non ha commentato ma filtra ottimismo sul rinnovo.", "Corriere dello Sport: '{$nome} wanted by three Premier League clubs'. {$team} no comment, but renewal optimism filters through.", "Corriere dello Sport: '{$nome} von drei Premier-League-Klubs umworben'. {$team} ohne Kommentar, doch Optimismus über eine Verlängerung sickert durch.", "Corriere dello Sport: '{$nome}, pretendido por tres clubes de la Premier League'. {$team} sin comentarios, pero se filtra optimismo sobre la renovación."), 'mercato'],
+            [_tn("💌 La lettera di un fan", "💌 A fan's letter", "💌 Der Brief eines Fans", "💌 La carta de un aficionado"), _tn("{$nome} ha condiviso sui social la lettera commovente di un giovane tifoso. 'È per questi momenti che mi sveglio ogni mattina e mi alleno'.", "{$nome} shared a moving letter from a young fan on social media. 'It's for moments like this that I get up every morning and train'.", "{$nome} teilte in den sozialen Medien einen bewegenden Brief eines jungen Fans. 'Für solche Momente stehe ich jeden Morgen auf und trainiere'.", "{$nome} compartió en redes una carta emotiva de un joven aficionado. 'Es por momentos como este que me levanto cada mañana a entrenar'."), 'positivo'],
+            [_tn("🦁 Capitano per un giorno", "🦁 Captain for a day", "🦁 Kapitän für einen Tag", "🦁 Capitán por un día"), _tn("Assenza del capitano titolare: {$nome} guida la squadra con la fascia al braccio per la prima volta. 'Un onore immenso'.", "The regular captain is absent: {$nome} leads the team with the armband for the first time. 'An immense honour'.", "Der etatmäßige Kapitän fehlt: {$nome} führt das Team zum ersten Mal mit der Binde an. 'Eine immense Ehre'.", "El capitán habitual está ausente: {$nome} lidera al equipo con el brazalete por primera vez. 'Un honor inmenso'."), 'positivo'],
+            [_tn("🎪 Testimonial d'eccezione", "🎪 Special ambassador", "🎪 Besonderer Botschafter", "🎪 Embajador especial"), _tn("{$nome} testimonial per una campagna di sensibilizzazione contro il bullismo nelle scuole. 'Chi mi bullizzava da piccolo ora mi chiede i selfie'.", "{$nome} is ambassador for an anti-bullying school campaign. 'Those who bullied me as a kid now ask for selfies'.", "{$nome} ist Botschafter einer Schulkampagne gegen Mobbing. 'Die mich als Kind gemobbt haben, fragen jetzt nach Selfies'.", "{$nome} es embajador de una campaña escolar contra el acoso. 'Los que me acosaban de niño ahora me piden selfies'."), 'positivo'],
+        ];
+        $notizie[] = $eventi[rand(0, count($eventi)-1)];
+    }
+
+    // Aggiungi notizie avanzate della partita specifica
+    if (!empty($partite) && rand(1,100) <= 75) {
+        $prime_partita = $partite[0] ?? [];
+        $pm_avv   = $prime_partita['avv']    ?? 'Avversario';
+        $pm_gf    = intval($prime_partita['gf'] ?? 0);
+        $pm_gs    = intval($prime_partita['gs'] ?? 0);
+        $pm_pgol  = intval($prime_partita['player_gol'] ?? 0);
+        $pm_pass  = intval($prime_partita['player_assist'] ?? 0);
+        $pm_pvoto = floatval($prime_partita['player_voto'] ?? 6.0);
+        $pm_esito = $prime_partita['esito'] ?? 'P';
+        $pm_gior  = intval($prime_partita['giornata'] ?? 0);
+        $pm_casa  = ($prime_partita['isHome'] ?? false) ? _tn('in casa','at home','zu Hause','en casa') : _tn('in trasferta','away','auswärts','fuera');
+        $advanced_news = getAdvancedMatchNews($nome, $team, $pm_avv, $pm_pgol, $pm_pass, $pm_pvoto, $pm_esito, $pm_gior, $pm_gf, $pm_gs, $pm_casa, $player_skills);
+        foreach ($advanced_news as $an) $notizie[] = $an;
+    }
+
+    // Aggiungi notizie extra dal pool esteso
+    if (rand(1,100) <= 60) {
+        $esito_principale = count($partite) > 0 ? ($partite[0]['esito'] ?? 'P') : 'P';
+        $extra_pool = getExtraNewsPool($nome, $team, count($partite) > 0 ? $partite[0]['avv'] : 'Avversario', $match['gol'] ?? 0, $match['assist'] ?? 0, $match['voto'] ?? 6.0, $esito_principale, $overall, $pop, $stelle, $anno, $mese);
+        foreach ($extra_pool as $ep) $notizie[] = $ep;
+    }
+
+    // ── 5. NOTIZIE EXTRA basate su gol del mese ────────────────────────────────
+    if ($tot_gol >= 5) {
+        $superscorer_pool = [
+            ["🚀 Superstar del mese!", "Cinque o più gol in un mese: {$nome} è una macchina da guerra offensiva. {$team} ringrazia il suo bomber d'eccezione.", 'positivo'],
+            ["🎆 Fuochi d'artificio!", "Non si smette di segnare: {$nome} ha già {$tot_gol} gol in questo mese! Una prestazione da antologia.", 'positivo'],
+            ["👑 Il Re della classifica marcatori", "{$nome} guida la classifica marcatori con una media impressionante. Questo mese da solo ne ha fatti {$tot_gol}. Leggendario.", 'positivo'],
+        ];
+        if (!empty($superscorer_pool)) $notizie[] = $superscorer_pool[rand(0, count($superscorer_pool)-1)];
+    }
+    if ($voto_medio >= 8.0 && $n_partite >= 2) {
+        $highrating_pool = [
+            ["⭐ Prestazioni da 10", "Voto medio di {$voto_medio} per {$nome}: un mese eccellente. Il pubblico è in delirio ogni volta che tocca palla.", 'positivo'],
+            ["🎯 Precisione da campione", "Media voto {$voto_medio}: {$nome} non ha sbagliato un colpo questo mese. Tecnica e continuità da fuoriclasse.", 'positivo'],
+        ];
+        if (!empty($highrating_pool)) $notizie[] = $highrating_pool[rand(0, count($highrating_pool)-1)];
+    }
+    if ($voto_medio < 5.5 && $n_partite >= 2) {
+        $lowrating_pool = [
+            [_tn("😞 Momento no", "😞 Off-form month", "😞 Schwacher Monat", "😞 Mes bajo de forma"), _tn("Media voto {$voto_medio}: un mese da dimenticare per {$nome}. Il tecnico lo ha tenuto fuori nell'ultima gara per recuperarlo.", "Avg rating {$voto_medio}: a month to forget for {$nome}. The coach left him out of the last game to help him recover.", "Schnitt {$voto_medio}: ein Monat zum Vergessen für {$nome}. Der Trainer ließ ihn im letzten Spiel draußen, damit er sich erholt.", "Media {$voto_medio}: un mes para olvidar para {$nome}. El entrenador lo dejó fuera del último partido para que se recuperara."), 'negativo'],
+            [_tn("💭 Testa altrove?", "💭 Head elsewhere?", "💭 Mit den Gedanken woanders?", "💭 ¿La cabeza en otra parte?"), _tn("Non è il {$nome} che conosciamo: media {$voto_medio} e tanti errori individuali. Serve ritrovare la forma migliore.", "This isn't the {$nome} we know: avg {$voto_medio} and too many individual errors. He needs to rediscover top form.", "Das ist nicht der {$nome}, den wir kennen: Schnitt {$voto_medio} und zu viele individuelle Fehler. Er muss zu seiner Topform zurückfinden.", "Este no es el {$nome} que conocemos: media {$voto_medio} y demasiados errores individuales. Necesita reencontrar su mejor forma."), 'negativo'],
+        ];
+        if (!empty($lowrating_pool)) $notizie[] = $lowrating_pool[rand(0, count($lowrating_pool)-1)];
+    }
+    // Assist hero month
+    if ($tot_assist >= 4) {
+        $assist_hero_pool = [
+            [_tn("🎪 Il Mago degli Assist", "🎪 The Assist Wizard", "🎪 Der Vorlagenzauberer", "🎪 El mago de las asistencias"), _tn("{$tot_assist} passaggi decisivi in {$n_partite} partite: {$nome} è il cervello della {$team} questo mese. Visione di gioco sopraffina.", "{$tot_assist} key passes in {$n_partite} matches: {$nome} is the brain of {$team} this month. Superb vision of the game.", "{$tot_assist} Schlüsselpässe in {$n_partite} Spielen: {$nome} ist in diesem Monat das Hirn von {$team}. Herausragende Spielübersicht.", "{$tot_assist} pases clave en {$n_partite} partidos: {$nome} es el cerebro del {$team} este mes. Una visión de juego soberbia."), 'positivo'],
+            [_tn("🔑 Le chiavi del gioco", "🔑 The keys to the game", "🔑 Die Schlüssel zum Spiel", "🔑 Las llaves del juego"), _tn("Assist, assist, assist: {$nome} ne sforna {$tot_assist} questo mese. 'Preferisco fare gol, ma se i compagni segnano sono felice lo stesso'.", "Assist, assist, assist: {$nome} produces {$tot_assist} this month. 'I prefer scoring, but if my team-mates score I\'m just as happy'.", "Vorlage, Vorlage, Vorlage: {$nome} legt diesen Monat {$tot_assist} auf. 'Ich treffe lieber selbst, aber wenn meine Mitspieler treffen, freue ich mich genauso'.", "Asistencia, asistencia, asistencia: {$nome} reparte {$tot_assist} este mes. 'Prefiero marcar, pero si mis compañeros marcan soy igual de feliz'."), 'positivo'],
+        ];
+        if (!empty($assist_hero_pool)) $notizie[] = $assist_hero_pool[rand(0, count($assist_hero_pool)-1)];
+    }
+    // Milestone check (random extra)
+    if (rand(1, 100) <= 25) {
+        $milestone_pool = [
+            [_tn("📆 La carriera cresce", "📆 Career on the rise", "📆 Karriere im Aufschwung", "📆 Carrera en ascenso"), _tn("Stagione dopo stagione, {$nome} continua a migliorare. 'Ogni anno imparo qualcosa di nuovo. Il calcio è una scuola infinita'.", "Season after season, {$nome} keeps improving. 'Every year I learn something new. Football is an endless school'.", "Saison für Saison wird {$nome} besser. 'Jedes Jahr lerne ich etwas Neues. Fußball ist eine endlose Schule'.", "Temporada tras temporada, {$nome} sigue mejorando. 'Cada año aprendo algo nuevo. El fútbol es una escuela sin fin'."), 'info'],
+            [_tn("🔭 Il futuro è brillante", "🔭 The future is bright", "🔭 Die Zukunft ist rosig", "🔭 El futuro es brillante"), _tn("I pronostici degli esperti sono unanimi: {$nome} ha ancora molto da dare. 'Il picco? Deve ancora arrivare', scrivono gli analisti.", "Expert forecasts are unanimous: {$nome} still has plenty to give. 'The peak? It\'s still to come', write the analysts.", "Expertenprognosen sind einhellig: {$nome} hat noch viel zu geben. 'Der Höhepunkt? Der kommt noch', schreiben die Analysten.", "Los pronósticos de los expertos son unánimes: a {$nome} le queda mucho por dar. '¿El pico? Aún está por llegar', escriben los analistas."), 'positivo'],
+            [_tn("📰 Numeri che parlano", "📰 The numbers speak", "📰 Die Zahlen sprechen", "📰 Los números hablan"), _tn("Le statistiche non mentono: {$nome} è tra i migliori della lega per xG, xA e xOvR. Un profilo da grande campione.", "Stats don\'t lie: {$nome} is among the best in the league for xG, xA and xOvR. The profile of a true champion.", "Statistiken lügen nicht: {$nome} gehört bei xG, xA und xOvR zu den Besten der Liga. Das Profil eines echten Champions.", "Las estadísticas no mienten: {$nome} está entre los mejores de la liga en xG, xA y xOvR. El perfil de un verdadero campeón."), 'info'],
+            [_tn("🎙️ La voce del tecnico", "🎙️ The coach speaks", "🎙️ Der Trainer spricht", "🎙️ Habla el entrenador"), _tn("Il mister in conferenza stampa: 'Con {$nome} in campo cambiano le dinamiche di ogni partita. È il nostro riferimento tecnico e mentale'.", "The coach at the press conference: 'With {$nome} on the pitch the dynamics of every match change. He\'s our technical and mental reference point'.", "Der Trainer auf der Pressekonferenz: 'Mit {$nome} auf dem Platz ändert sich die Dynamik jedes Spiels. Er ist unser technischer und mentaler Bezugspunkt'.", "El entrenador en rueda de prensa: 'Con {$nome} en el campo cambia la dinámica de cada partido. Es nuestro referente técnico y mental'."), 'positivo'],
+            [_tn("🔮 Il prossimo step", "🔮 The next step", "🔮 Der nächste Schritt", "🔮 El siguiente paso"), _tn("Gli osservatori sono d'accordo: {$nome} è pronto per il salto di qualità. La domanda non è se, ma quando.", "Observers agree: {$nome} is ready to make the quality leap. The question isn\'t if, but when.", "Beobachter sind sich einig: {$nome} ist bereit für den Qualitätssprung. Die Frage ist nicht ob, sondern wann.", "Los observadores coinciden: {$nome} está listo para dar el salto de calidad. La pregunta no es si, sino cuándo."), 'info'],
+        ];
+        if (!empty($milestone_pool)) $notizie[] = $milestone_pool[rand(0, count($milestone_pool)-1)];
+    }
+
+    // Restituisce l'array invece di scrivere nel DB
+    return $notizie;
+}
+
+// ── Public wrapper: generates news in both IT and EN, saves bilingual ────────
+function generaNotizieDinamiche($db, $player_id, $p, $match, $lega_result, $player_skills = []) {
+    $anno = $p['anno_corrente'];
+    $mese = $p['mese_corrente'];
+
+    // Use a deterministic seed so both IT and EN calls make identical random choices
+    // Seed is based on player+anno+mese so it's unique per month but reproducible
+    $seed = crc32("gs_{$player_id}_{$anno}_{$mese}");
+
+    // Generate Italian version
+    $GLOBALS['_gsLangOverride'] = 'it';
+    mt_srand($seed);
+    $notizie_it = _buildNotizie($p, $match, $lega_result, $player_skills);
+
+    // Generate English version with identical random sequence
+    $GLOBALS['_gsLangOverride'] = 'en';
+    mt_srand($seed);
+    $notizie_en = _buildNotizie($p, $match, $lega_result, $player_skills);
+
+    // Generate German version with identical random sequence
+    $GLOBALS['_gsLangOverride'] = 'de';
+    mt_srand($seed);
+    $notizie_de = _buildNotizie($p, $match, $lega_result, $player_skills);
+
+    // Generate Spanish version with identical random sequence
+    $GLOBALS['_gsLangOverride'] = 'es';
+    mt_srand($seed);
+    $notizie_es = _buildNotizie($p, $match, $lega_result, $player_skills);
+
+    // Restore
+    $GLOBALS['_gsLangOverride'] = null;
+    mt_srand(); // restore random seed
+
+    $count = min(count($notizie_it), count($notizie_en), count($notizie_de), count($notizie_es));
+    for ($i = 0; $i < $count; $i++) {
+        $it = $notizie_it[$i];
+        $en = $notizie_en[$i];
+        $de = $notizie_de[$i];
+        $es = $notizie_es[$i];
+        generaNotizia($db, $player_id, $anno, $mese,
+            $it[0], $it[1], $it[2],  // titolo_it, testo_it, tipo
+            $en[0], $en[1],           // titolo_en, testo_en
+            $de[0], $de[1],           // titolo_de, testo_de
+            $es[0], $es[1]            // titolo_es, testo_es
+        );
+    }
+}
+
+function getPlayerSkills($db, $player_id) {
+    try {
+        $stmt = $db->prepare("SELECT skill_id, level FROM skill_boosts WHERE player_id=? AND level > 0");
+        $stmt->execute([$player_id]);
+        $skills = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $skills[$row['skill_id']] = intval($row['level']);
+        }
+        return $skills;
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+function getGolType($p, $skills) {
+    // Build pool of possible gol types based on unlocked skills
+    // Each entry: [type_key, weight, description_template]
+    $pool = [];
+    $nome = $p['player_name'];
+
+    // Base types always available
+    $pool[] = ['base_dx', 10, null]; // handled separately
+
+    // Tiro potente (tiro_potente >= 1)
+    if (isset($skills['tiro_potente'])) {
+        $w = $skills['tiro_potente'] >= 2 ? 25 : 15;
+        $pool[] = ['tiro_potente', $w, [
+            _tn("con un tiro potentissimo che ha bucato il portiere","with a thunderous strike that beat the keeper","mit einem wuchtigen Schuss, der den Keeper bezwang","con un disparo potentísimo que batió al portero"),
+            _tn("con una cannonata da fuori area impossibile da fermare","with an unstoppable rocket from outside the box","mit einem unhaltbaren Geschoss von außerhalb des Strafraums","con un cañonazo desde fuera del área imposible de parar"),
+            _tn("con un destro/sinistro di potenza pazzesca da dentro l'area","with an incredibly powerful shot from inside the box","mit einem unglaublich kraftvollen Schuss aus dem Strafraum","con un disparo de potencia brutal desde dentro del área")
+        ]];
+    }
+    // Tiro a giro / trivella (tiro_giro >= 1)
+    if (isset($skills['tiro_giro'])) {
+        $w = $skills['tiro_giro'] >= 2 ? 22 : 14;
+        $pool[] = ['tiro_giro', $w, [
+            _tn("con un tiro angolato a giro sul secondo palo","with a curling shot into the far corner","mit einem gekrümmten Schuss ins lange Eck","con un disparo colocado y curvo al segundo palo"),
+            _tn("con una trivella sul palo lontano, traiettoria imprendibile","with a knuckleball to the far post, an unreachable trajectory","mit einem Flatterball ans lange Eck, unerreichbare Flugbahn","con una rosca al palo lejano, trayectoria inalcanzable"),
+            _tn("con un tiro a giro all'incrocio dei pali di rara bellezza","with a curling shot into the top corner of rare beauty","mit einem gekrümmten Schuss in den Winkel von seltener Schönheit","con un disparo curvo a la escuadra de rara belleza")
+        ]];
+    }
+    // Colpo di testa (colpo_testa >= 1)
+    if (isset($skills['colpo_testa'])) {
+        $w = $skills['colpo_testa'] >= 2 ? 20 : 12;
+        $pool[] = ['colpo_testa', $w, [
+            _tn("di testa, saltando sopra a tutti i difensori sul cross","with a header, rising above every defender on the cross","per Kopf, über alle Verteidiger steigend bei der Flanke","de cabeza, saltando por encima de todos los defensores en el centro"),
+            _tn("con un colpo di testa imperioso che non ha lasciato scampo","with a commanding header that left no chance","mit einem gebieterischen Kopfball, der keine Chance ließ","con un cabezazo imperioso que no dejó opción"),
+            _tn("di testa su corner, dominando il difensore in elevazione","with a header from a corner, dominating his marker in the air","per Kopf nach Ecke, den Gegenspieler in der Luft beherrschend","de cabeza tras córner, dominando al defensor en el salto")
+        ]];
+    }
+    // Turbo / velocista -> gol in velocità
+    if (isset($skills['turbo']) || isset($skills['velocista'])) {
+        $w = isset($skills['turbo']) ? 20 : 12;
+        $pool[] = ['velocita', $w, [
+            _tn("con uno scatto fulmineo che ha bruciato la difesa in velocità","with a lightning burst that scorched the defence for pace","mit einem blitzartigen Antritt, der die Abwehr im Tempo überlief","con un arranque fulgurante que quemó a la defensa en velocidad"),
+            _tn("dopo aver seminato tre difensori in ripartenza fulminante","after leaving three defenders behind on a lightning counter","nachdem er drei Verteidiger im blitzschnellen Konter stehen ließ","tras dejar atrás a tres defensores en un contragolpe fulgurante"),
+            _tn("con una corsa velocissima e un tiro a botta sicura","with a blistering run and a clinical finish","mit einem rasend schnellen Lauf und einem sicheren Abschluss","con una carrera velocísima y una definición segura")
+        ]];
+    }
+    // Gol di Rabona (gol_rabona >= 1)
+    if (isset($skills['gol_rabona'])) {
+        $pool[] = ['rabona', 18, [
+            _tn("con una RABONA da urlo che ha lasciato tutti di stucco!","with a screamer of a RABONA that stunned everyone!","mit einer sensationellen RABONA, die alle verblüffte!","¡con una RABONA de escándalo que dejó a todos atónitos!"),
+            _tn("con una rabona leggendaria: il pubblico è esploso in un boato!","with a legendary rabona: the crowd erupted in a roar!","mit einer legendären Rabona: das Publikum brüllte vor Begeisterung!","¡con una rabona legendaria: el público estalló en un rugido!")
+        ]];
+    }
+    // Istinto del goleador
+    if (isset($skills['istinto'])) {
+        $pool[] = ['istinto', 15, [
+            _tn("con il suo istinto da goleador puro: palla sul piede, gol","with pure goalscorer's instinct: ball to feet, goal","mit reinem Torjägerinstinkt: Ball am Fuß, Tor","con puro instinto de goleador: balón al pie, gol"),
+            _tn("trovandosi nel posto giusto al momento giusto — istinto puro","being in the right place at the right time — pure instinct","zur richtigen Zeit am richtigen Ort — purer Instinkt","estando en el lugar correcto en el momento correcto — puro instinto")
+        ]];
+    }
+    // Da punizione (freddezza >= 2)
+    if (isset($skills['freddezza']) && $skills['freddezza'] >= 2) {
+        $pool[] = ['punizione', 14, [
+            _tn("con un gol direttamente da calcio di punizione, potente e angolato","with a goal straight from a free-kick, powerful and placed","mit einem direkt verwandelten Freistoß, kraftvoll und platziert","con un gol directo de falta, potente y colocado"),
+            _tn("da punizione, superando la barriera con un tiro preciso come un laser","from a free-kick, beating the wall with a laser-precise shot","per Freistoß, die Mauer mit einem laserpräzisen Schuss überwindend","de falta, superando la barrera con un disparo preciso como un láser")
+        ]];
+    }
+
+    // Weighted random
+    $total = array_sum(array_column($pool, 1));
+    $rand = rand(1, $total);
+    $cum = 0;
+    foreach ($pool as $entry) {
+        $cum += $entry[1];
+        if ($rand <= $cum) {
+            if ($entry[0] === 'base_dx' || $entry[2] === null) return null; // use default
+            $descs = $entry[2];
+            return ['type' => $entry[0], 'desc' => !empty($descs) ? $descs[rand(0, count($descs)-1)] : ''];
+        }
+    }
+    return null;
+}
+
+function simulateMatch($p, $skills = []) {
+    $team_stars = intval($p['team_stelle'] ?? 1);
+    $form  = ($p['morale'] + $p['energia']) / 2;
+
+    // Bonus piede forte/debole
+    $piede_forte = intval($p['piede_forte'] ?? 3);
+    $piede_bonus = ($piede_forte / 5) * 5; // up to +5 bonus to power
+
+    $power = min(100, ($p['overall']*0.5) + ($form*0.3) + ($team_stars*10*0.2) + $piede_bonus);
+    $gol=0; $assist=0;
+    for ($i=0;$i<4;$i++) if (rand(1,100)<$power*0.4) $gol++;
+    for ($i=0;$i<3;$i++) if (rand(1,100)<$power*0.3) $assist++;
+
+    // Formula voto:
+    // - Base 5.5: un professionista parte da "sufficiente"
+    // - Gol vale +1.0: segna 2 gol → almeno 7.5 garantito
+    // - Assist vale +0.6
+    // - Rumore casuale ridotto (±0.56) così non azzera mai una doppietta
+    // - OVR alto = leggero bonus costanza; bassa forma = bias negativo
+    $ovr_factor  = ($p['overall'] - 50) / 75.0; // 0.0–1.0
+    $noise       = rand(-8, 8) * 0.07;
+    if ($form < 50) $noise -= 0.3; // penalità se forma scarsa
+    $voto = round(5.5 + $gol*1.0 + $assist*0.6 + $noise + $ovr_factor*0.5, 1);
+    $voto = max(4.5, min(10.0, $voto));
+    $stipendio = $p['overall']*$p['moltiplicatore_stipendio']*100+$gol*1500+$assist*800;
+    $pop_gain  = $gol*5+$assist*2+($voto>7?5:0);
+    $morale    = ($voto>=7)?rand(10,25):rand(-8,0);
+    $perf_word = _tn('stellare','stellar','glänzend','estelar');
+    $perf_poor = _tn('opaca','poor','schwach','floja');
+    $perf = $voto >= 7 ? $perf_word : $perf_poor;
+    $descs = [
+        _tn("{$gol} gol e {$assist} assist! Voto: {$voto}",
+            "{$gol} goal(s) and {$assist} assist(s)! Rating: {$voto}",
+            "{$gol} Tor/Tore und {$assist} Vorlage(n)! Bewertung: {$voto}",
+            "{$gol} gol y {$assist} asistencia(s)! Valoración: {$voto}"),
+        _tn("Prestazione {$perf} – {$gol} gol. Voto {$voto}",
+            "{$perf} performance – {$gol} goal(s). Rating {$voto}",
+            "{$perf} Leistung – {$gol} Tor/Tore. Bewertung {$voto}",
+            "Actuación {$perf} – {$gol} gol(es). Valoración {$voto}"),
+    ];
+
+    // Determine gol type for news
+    $gol_type = null;
+    if ($gol > 0 && !empty($skills)) {
+        $gol_type = getGolType($p, $skills);
+    }
+
+    return ['gol'=>$gol,'assist'=>$assist,'voto'=>$voto,'stipendio'=>round($stipendio),'pop_gain'=>$pop_gain,'morale'=>$morale,'desc'=>$descs[rand(0,1)],'gol_type'=>$gol_type];
+}
+
+function getBonusStruttura($livello) {
+    if (!$livello) return ['bonus_allenamento'=>0,'bonus_crescita'=>0,'riduzione_infortuni'=>0];
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM strutture WHERE livello=?");
+    $stmt->execute([$livello]);
+    return $stmt->fetch() ?: ['bonus_allenamento'=>0,'bonus_crescita'=>0,'riduzione_infortuni'=>0];
+}
+
+function calcPalloneDoro($db, $player_id, $p, $overall, $gol_carriera, $assist_carriera) {
+    $anno = $p['anno_corrente'];
+    $stmt = $db->prepare("SELECT SUM(gol) as gol,SUM(assist) as assist,AVG(voto) as voto,COUNT(*) as partite_reali FROM log_mensile WHERE player_id=? AND anno=? AND avv!='' AND avv!='__riepilogo'");
+    $stmt->execute([$player_id,$anno]);
+    $stats = $stmt->fetch();
+    $lega_bonus = (intval($p['lega_livello']??2)==1)?20:0;
+    $score = ($stats['gol']??0)*3+($stats['assist']??0)*2+($stats['voto']??6)*5+$overall*0.5+$p['popolarita']*0.3+$lega_bonus;
+    $pallone_pos=0;$msg='';$won=0;
+    if ($score>=220)     {$pallone_pos=1;          $msg="🏆 HAI VINTO IL PALLONE D'ORO!!!";$won=1;}
+    elseif ($score>=175) {$pallone_pos=rand(2,3);  $msg="🥈 Finalista al Pallone d'Oro (#{$pallone_pos})!";}
+    elseif ($score>=130) {$pallone_pos=rand(4,10); $msg="⭐ Top 10 al Pallone d'Oro!";}
+    elseif ($score>=90)  {$pallone_pos=rand(11,30);$msg="Top 30 al Pallone d'Oro.";}
+    else                 {$msg="Non nominato al Pallone d'Oro quest'anno.";}
+    $db->prepare("INSERT IGNORE INTO stagioni (player_id,anno,gol,assist,partite,media_voto,pallone_doro_pos,team_nome,lega_nome) VALUES(?,?,?,?,?,?,?,?,?)")
+       ->execute([$player_id,$anno,$stats['gol']??0,$stats['assist']??0,intval($stats['partite_reali']??0),round($stats['voto']??6,2),$pallone_pos,$p['team_nome_full']??'',$p['lega_nome']??'']);
+    if ($won) $db->prepare("UPDATE players SET palloni_doro=palloni_doro+1 WHERE id=?")->execute([$player_id]);
+    return ['pos'=>$pallone_pos,'msg'=>$msg,'score'=>round($score)];
+}
+
+function calcEpilogo($db, $player_id) {
+    // Mantiene la firma originale (ritorna una stringa breve) per retro-compatibilità.
+    $r = buildCareerSummary($db, $player_id);
+    return $r['titolo'] . ' ' . $r['emoji'];
+}
+
+/**
+ * Costruisce il riepilogo completo di fine carriera: statistiche lifetime,
+ * voto alla carriera (0-100), titolo onorifico e confronto con leggende NPC.
+ * Restituisce un array strutturato consumato dalla schermata di ritiro.
+ */
+function buildCareerSummary($db, $player_id) {
+    $stmt = $db->prepare("SELECT * FROM players WHERE id=?");
+    $stmt->execute([$player_id]);
+    $p = $stmt->fetch();
+    if (!$p) return ['voto'=>0,'titolo'=>'','emoji'=>'','stats'=>[],'confronto'=>[],'verdetto'=>''];
+
+    // ── Statistiche lifetime aggregate dalle stagioni ────────────────────────
+    $st = $db->prepare("SELECT COUNT(*) stagioni, COALESCE(SUM(partite),0) partite,
+                               COALESCE(SUM(gol),0) gol, COALESCE(SUM(assist),0) assist,
+                               COALESCE(AVG(NULLIF(media_voto,0)),6.0) media_voto
+                        FROM stagioni WHERE player_id=?");
+    $st->execute([$player_id]);
+    $agg = $st->fetch() ?: [];
+
+    // Fallback sui contatori del giocatore se le stagioni non coprono tutto
+    $gol     = max(intval($agg['gol'] ?? 0), intval($p['gol_carriera']));
+    $assist  = max(intval($agg['assist'] ?? 0), intval($p['assist_carriera']));
+    $partite = intval($agg['partite'] ?? 0);
+    $stagioni = max(1, intval($agg['stagioni'] ?? 0));
+    $media_voto = round(floatval($agg['media_voto'] ?? 6.0), 2);
+    $palloni = intval($p['palloni_doro']);
+    $trofei  = intval($p['trofei']);
+    $overall_max = intval($p['overall']);
+    $anni_carriera = max(1, intval($p['age']) - 16);
+    $gol_partita = $partite > 0 ? round($gol / $partite, 2) : 0;
+
+    // ── Voto alla carriera (0-100) ───────────────────────────────────────────
+    // Pesi: Palloni d'Oro e trofei dominano, poi gol, overall di picco, media voto.
+    $voto = 0;
+    $voto += min(40, $palloni * 13);              // fino a 40 pt (3+ Palloni d'Oro)
+    $voto += min(20, $trofei * 2.5);              // fino a 20 pt
+    $voto += min(18, $gol * 0.05);                // fino a 18 pt (360+ gol)
+    $voto += min(12, max(0, ($overall_max - 60) * 0.4)); // fino a 12 pt (overall 90)
+    $voto += min(10, max(0, ($media_voto - 6.0) * 5));   // fino a 10 pt (media 8.0)
+    $voto = (int) round(min(100, $voto));
+
+    // ── Titolo onorifico in base al voto ─────────────────────────────────────
+    if ($voto >= 88)      { $titolo = _tn('LEGGENDA IMMORTALE','IMMORTAL LEGEND','UNSTERBLICHE LEGENDE','LEYENDA INMORTAL'); $emoji='👑'; }
+    elseif ($voto >= 72)  { $titolo = _tn('Fuoriclasse Mondiale','World-Class Superstar','Weltklasse-Superstar','Superestrella Mundial'); $emoji='🌟'; }
+    elseif ($voto >= 55)  { $titolo = _tn('Grande Campione','Great Champion','Großer Champion','Gran Campeón'); $emoji='🏆'; }
+    elseif ($voto >= 38)  { $titolo = _tn('Idolo Nazionale','National Idol','Nationaler Idol','Ídolo Nacional'); $emoji='⭐'; }
+    elseif ($voto >= 22)  { $titolo = _tn('Professionista Solido','Solid Professional','Solider Profi','Profesional Sólido'); $emoji='⚽'; }
+    else                  { $titolo = _tn('Talento Incompiuto','Unfulfilled Talent','Unerfülltes Talent','Talento Inacabado'); $emoji='💫'; }
+
+    // ── Verdetto narrativo ───────────────────────────────────────────────────
+    $nome = $p['player_name'];
+    if ($voto >= 88)      $verdetto = _tn("Il nome di {$nome} sarà inciso per sempre nella storia del calcio. Generazioni future studieranno le sue giocate.","{$nome}'s name will be etched in football history forever. Future generations will study every move.","Der Name {$nome} wird für immer in die Fußballgeschichte eingehen. Künftige Generationen werden jeden Spielzug studieren.","El nombre de {$nome} quedará grabado para siempre en la historia del fútbol. Las generaciones futuras estudiarán cada jugada.");
+    elseif ($voto >= 72)  $verdetto = _tn("Una carriera straordinaria. {$nome} ha regalato emozioni a milioni di tifosi e lascia un'eredità pesante.","An extraordinary career. {$nome} thrilled millions of fans and leaves a heavy legacy.","Eine außergewöhnliche Karriere. {$nome} hat Millionen Fans begeistert und hinterlässt ein schweres Erbe.","Una carrera extraordinaria. {$nome} emocionó a millones de aficionados y deja un legado importante.");
+    elseif ($voto >= 55)  $verdetto = _tn("Una carriera di altissimo livello, costellata di successi. {$nome} può ritirarsi a testa alta.","A top-level career full of success. {$nome} can retire with his head held high.","Eine Karriere auf höchstem Niveau voller Erfolge. {$nome} kann erhobenen Hauptes abtreten.","Una carrera de altísimo nivel, repleta de éxitos. {$nome} puede retirarse con la cabeza bien alta.");
+    elseif ($voto >= 38)  $verdetto = _tn("Una carriera rispettabile. {$nome} è stato un punto di riferimento per la sua squadra e i suoi tifosi.","A respectable career. {$nome} was a reference point for his team and fans.","Eine respektable Karriere. {$nome} war ein Bezugspunkt für sein Team und seine Fans.","Una carrera respetable. {$nome} fue un referente para su equipo y su afición.");
+    elseif ($voto >= 22)  $verdetto = _tn("Una carriera onesta, fatta di lavoro e dedizione. Non tutti arrivano in alto, ma {$nome} ci ha provato fino in fondo.","An honest career built on hard work and dedication. Not everyone reaches the top, but {$nome} gave it everything.","Eine ehrliche Karriere voller Arbeit und Hingabe. Nicht jeder kommt nach oben, doch {$nome} hat alles gegeben.","Una carrera honesta, hecha de trabajo y dedicación. No todos llegan a lo más alto, pero {$nome} lo intentó hasta el final.");
+    else                  $verdetto = _tn("Il talento c'era, forse è mancato qualcosa. Ma il viaggio di {$nome} resta una bella storia da raccontare.","The talent was there, maybe something was missing. But {$nome}'s journey remains a fine story to tell.","Das Talent war da, vielleicht fehlte etwas. Doch die Reise von {$nome} bleibt eine schöne Geschichte.","El talento estaba, quizá faltó algo. Pero el viaje de {$nome} sigue siendo una bonita historia que contar.");
+
+    // ── Confronto con leggende NPC ───────────────────────────────────────────
+    // Leggende fittizie con il loro "voto carriera" di riferimento.
+    $leggende = [
+        ['nome'=>'Diego "El Genio"',     'voto'=>97, 'desc'=>_tn('3 Palloni d\'Oro','3 Ballon d\'Ors','3 Ballons d\'Or','3 Balones de Oro')],
+        ['nome'=>'O. Da Silva',          'voto'=>92, 'desc'=>_tn('Bomber leggendario','Legendary striker','Legendärer Stürmer','Delantero legendario')],
+        ['nome'=>'M. König',             'voto'=>84, 'desc'=>_tn('Maestro del centrocampo','Midfield maestro','Mittelfeld-Maestro','Maestro del centro')],
+        ['nome'=>'L. Fernández',         'voto'=>70, 'desc'=>_tn('Stella di una generazione','A generation\'s star','Star einer Generation','Estrella de una generación')],
+        ['nome'=>'T. Andersson',         'voto'=>52, 'desc'=>_tn('Solido professionista','Solid pro','Solider Profi','Profesional sólido')],
+    ];
+    // Trova dove si posiziona il giocatore rispetto alle leggende
+    $confronto = [];
+    foreach ($leggende as $lg) {
+        $confronto[] = ['nome'=>$lg['nome'], 'voto'=>$lg['voto'], 'desc'=>$lg['desc'], 'is_player'=>false];
+    }
+    $confronto[] = ['nome'=>$nome, 'voto'=>$voto, 'desc'=>$titolo, 'is_player'=>true];
+    usort($confronto, fn($a,$b)=> $b['voto'] <=> $a['voto']);
+    $rank = 1;
+    foreach ($confronto as $i=>$c) { if ($c['is_player']) { $rank = $i+1; break; } }
+
+    return [
+        'voto'      => $voto,
+        'titolo'    => $titolo,
+        'emoji'     => $emoji,
+        'verdetto'  => $verdetto,
+        'rank_leggende' => $rank,
+        'stats'     => [
+            'nome'        => $nome,
+            'palloni_doro'=> $palloni,
+            'trofei'      => $trofei,
+            'gol'         => $gol,
+            'assist'      => $assist,
+            'partite'     => $partite,
+            'stagioni'    => $stagioni,
+            'media_voto'  => $media_voto,
+            'overall_max' => $overall_max,
+            'gol_partita' => $gol_partita,
+            'eta'         => intval($p['age']),
+        ],
+        'confronto' => $confronto,
+    ];
+}
+
+function buyStruttura($player_id, $data) {
+    $db = getDB();
+    $p  = getPlayerData($player_id);
+    $livello = intval($data['livello']??1);
+    $stmt = $db->prepare("SELECT * FROM strutture WHERE livello=?"); $stmt->execute([$livello]);
+    $struttura = $stmt->fetch();
+    if (!$struttura)                         {echo json_encode(['error'=>t('Struttura non trovata','Facility not found')]);return;}
+    if ($p['struttura_livello']>=$livello)   {echo json_encode(['error'=>t('Hai già questo livello','You already have this level')]);return;}
+    if ($p['struttura_livello']<$livello-1)  {echo json_encode(['error'=>t('Acquista prima il livello precedente','Buy the previous level first')]);return;}
+    if ($p['soldi']<$struttura['costo'])     {echo json_encode(['error'=>t('Soldi insufficienti','Insufficient funds')]);return;}
+    $db->prepare("UPDATE players SET struttura_livello=?,soldi=soldi-? WHERE id=?")->execute([$livello,$struttura['costo'],$player_id]);
+    echo json_encode(['success'=>true,'msg'=>t("Costruito: ","Built: ","Gebaut: ","Construido: ").$struttura['nome']."!"]);
+}
+
+function changeTeam($player_id, $data) {
+    $db = getDB();
+    $p  = getPlayerData($player_id);
+
+    // Un solo trasferimento per stagione
+    if ((int)($p['trasferimento_anno'] ?? 0) >= 1) {
+        echo json_encode(['error' => t('Hai già effettuato un trasferimento questa stagione.','You have already transferred this season.','Du hast diese Saison bereits einen Transfer durchgeführt.','Ya has realizado un fichaje esta temporada.')]);
+        return;
+    }
+
+    $team_id = intval($data['team_id']??1);
+    $stmt = $db->prepare("SELECT t.*,l.livello as lega_livello FROM teams t JOIN leghe l ON t.lega_id=l.id WHERE t.id=?");
+    $stmt->execute([$team_id]);
+    $team = $stmt->fetch();
+    if (!$team) {echo json_encode(['error'=>t('Squadra non trovata','Team not found','Team nicht gefunden','Equipo no encontrado')]);return;}
+
+    // Scala adattata al nuovo cap 125: 1*=55 2*=75 3*=90 4*=105 5*=120
+    $stelle_map = [1=>55, 2=>75, 3=>90, 4=>105, 5=>120];
+    $min_overall = $stelle_map[$team['stelle']] ?? 55;
+
+    // Applica sconto OVR agente
+    $agent = getAgentBonus($db, $player_id);
+    $sconto = $agent['bonus_ovr_sconto'] ?? 0;
+    $min_overall_scontato = max(55, intval($min_overall * (1 - $sconto/100)));
+
+    if ($p['overall'] < $min_overall_scontato && $team['stelle'] > 1) {
+        $msg_sconto_it = $sconto > 0 ? " (ridotto da {$min_overall} grazie all'agente -".$sconto."%)" : "";
+        $msg_sconto_en = $sconto > 0 ? " (reduced from {$min_overall} thanks to agent -".$sconto."%)" : "";
+        $msg_sconto_de = $sconto > 0 ? " (reduziert von {$min_overall} dank Agent -".$sconto."%)" : "";
+        $msg_sconto_es = $sconto > 0 ? " (reducido de {$min_overall} gracias al agente -".$sconto."%)" : "";
+        echo json_encode(['error'=> t(
+            "Overall insufficiente. Serve almeno {$min_overall_scontato}{$msg_sconto_it}",
+            "Overall too low. Need at least {$min_overall_scontato}{$msg_sconto_en}",
+            "Overall zu niedrig. Mindestens {$min_overall_scontato}{$msg_sconto_de} erforderlich",
+            "Overall insuficiente. Se necesitan al menos {$min_overall_scontato}{$msg_sconto_es}"
+        )]);
+        return;
+    }
+    $db->prepare("UPDATE players SET team_id=?, trasferimento_anno=1 WHERE id=?")->execute([$team_id,$player_id]);
+    echo json_encode(['success'=>true,'msg'=>t("Trasferito a ","Transferred to ","Zu ","Fichado por ").$team['nome']."!"]);
+}
+
+// ── SKILL TREE BOOST FUNCTIONS ──
+
+/**
+ * Applica il boost di una skill alle stat del giocatore nel DB.
+ * Logica: ogni skill ha un boost TOTALE per livello (boostPerLv = [2,4,7]).
+ * Il DB tiene traccia del boost già applicato per skill (skill_boosts.amount = boost totale attuale).
+ * La differenza (nuovo_totale - vecchio_totale) viene applicata alla stat.
+ * Così si può chiamare N volte senza duplicare i boost.
+ *
+ * data: { skill_id, stat, total_boost, level }
+ */
+function applySkillBoost($player_id, $data) {
+    $db        = getDB();
+    $skill_id  = trim($data['skill_id'] ?? '');
+    $stat      = trim($data['stat']     ?? '');
+    $new_total = intval($data['total_boost'] ?? 0); // boost TOTALE al livello corrente
+    $level     = intval($data['level']  ?? 1);
+
+    $allowed = ['tiro','velocita','dribbling','fisico','mentalita'];
+    if (!in_array($stat, $allowed)) {
+        echo json_encode(['error' => t("Stat non valida: $stat", "Invalid stat: $stat")]); return;
+    }
+    if (empty($skill_id)) {
+        echo json_encode(['error' => t('skill_id mancante','skill_id missing')]); return;
+    }
+    if ($new_total < 0 || $new_total > 50) {
+        echo json_encode(['error' => t("Boost fuori range: $new_total", "Boost out of range: $new_total")]); return;
+    }
+
+    // Leggi boost precedente già applicato per questa skill
+    $stmt = $db->prepare("SELECT amount FROM skill_boosts WHERE player_id=? AND skill_id=?");
+    $stmt->execute([$player_id, $skill_id]);
+    $existing = $stmt->fetch();
+    $old_total = $existing ? intval($existing['amount']) : 0;
+
+    $delta = $new_total - $old_total; // quanto aggiungere (può essere 0 se già applicato)
+
+    // Leggi stat corrente del giocatore
+    $stmt2 = $db->prepare("SELECT tiro, velocita, dribbling, fisico, mentalita FROM players WHERE id=?");
+    $stmt2->execute([$player_id]);
+    $p = $stmt2->fetch();
+    if (!$p) { echo json_encode(['error' => t('Giocatore non trovato','Player not found')]); return; }
+
+    $currentStat = intval($p[$stat]);
+    $newStat     = min(125, max(1, $currentStat + $delta));
+
+    // Ricalcola overall
+    $statMap = ['tiro'=>$p['tiro'],'velocita'=>$p['velocita'],'dribbling'=>$p['dribbling'],'fisico'=>$p['fisico'],'mentalita'=>$p['mentalita']];
+    $statMap[$stat] = $newStat;
+    $newOverall = intval(array_sum($statMap) / 5);
+
+    // Aggiorna giocatore solo se c'è un delta reale
+    if ($delta !== 0) {
+        $db->prepare("UPDATE players SET {$stat}=?, overall=? WHERE id=?")
+           ->execute([$newStat, $newOverall, $player_id]);
+    }
+
+    // Salva/aggiorna il boost applicato per questa skill
+    $db->prepare("REPLACE INTO skill_boosts (player_id, skill_id, stat, amount, level) VALUES (?,?,?,?,?)")
+       ->execute([$player_id, $skill_id, $stat, $new_total, $level]);
+
+    // ── Aggiorna piede_forte / piede_debole / livello_skill in base alle skill sbloccate ──
+    // Conta quante skill offensive del tiro/fisico sono sbloccate e a che livello
+    $stmt_all = $db->prepare("SELECT skill_id, level FROM skill_boosts WHERE player_id=? AND level > 0");
+    $stmt_all->execute([$player_id]);
+    $all_skills = [];
+    foreach ($stmt_all->fetchAll() as $row) $all_skills[$row['skill_id']] = intval($row['level']);
+
+    // Piede forte: base 3/5. Sale con tiro_potente (lv2->4, lv3->5) o tiro_giro lv2
+    $piede_forte = 3;
+    if (isset($all_skills['tiro_potente'])) {
+        if ($all_skills['tiro_potente'] >= 3) $piede_forte = 5;
+        elseif ($all_skills['tiro_potente'] >= 2) $piede_forte = 4;
+    }
+    if (isset($all_skills['tiro_giro']) && $all_skills['tiro_giro'] >= 2) $piede_forte = max($piede_forte, 5);
+    if (isset($all_skills['gol_rabona'])) $piede_forte = 5;
+
+    // Piede debole: base 2/5. Sale con fredezza lv2->3, lv3->4; istinto lv2->5
+    $piede_debole = 2;
+    if (isset($all_skills['freddezza'])) {
+        if ($all_skills['freddezza'] >= 3) $piede_debole = 4;
+        elseif ($all_skills['freddezza'] >= 2) $piede_debole = 3;
+    }
+    if (isset($all_skills['istinto']) && $all_skills['istinto'] >= 2) $piede_debole = max($piede_debole, 5);
+
+    // Livello skill: conta skill_id sbloccate
+    $num_skills = count($all_skills);
+    if ($num_skills >= 10) $livello_skill = 5;
+    elseif ($num_skills >= 7) $livello_skill = 4;
+    elseif ($num_skills >= 4) $livello_skill = 3;
+    elseif ($num_skills >= 2) $livello_skill = 2;
+    else $livello_skill = 2;
+
+    $db->prepare("UPDATE players SET piede_forte=?, piede_debole=?, livello_skill=? WHERE id=?")
+       ->execute([$piede_forte, $piede_debole, $livello_skill, $player_id]);
+
+    echo json_encode([
+        'success'      => true,
+        'delta'        => $delta,
+        'new_val'      => $newStat,
+        'new_overall'  => $newOverall,
+        'stat'         => $stat,
+        'piede_forte'  => $piede_forte,
+        'piede_debole' => $piede_debole,
+        'livello_skill'=> $livello_skill,
+    ]);
+}
+
+/**
+ * Restituisce tutti i boost skill applicati per questo giocatore.
+ * Usato dal frontend per sincronizzare lo stato.
+ */
+function getSkillBoosts($player_id) {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT skill_id, stat, amount, level FROM skill_boosts WHERE player_id=?");
+    $stmt->execute([$player_id]);
+    $rows = $stmt->fetchAll();
+    $boosts = [];
+    foreach ($rows as $r) {
+        $boosts[$r['skill_id']] = [
+            'stat'   => $r['stat'],
+            'amount' => intval($r['amount']), // boost totale applicato
+            'level'  => intval($r['level']),
+        ];
+    }
+    echo json_encode(['success'=>true, 'boosts'=>$boosts]);
+}
